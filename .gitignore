@@ -4,3 +4,4 @@ reference/
 # ESP-IDF 构建产物
 build/
 sdkconfig.old
+.vscode/
