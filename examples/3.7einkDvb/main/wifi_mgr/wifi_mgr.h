@@ -9,6 +9,10 @@
 #define WIFI_AP_CHANNEL  36
 #define WIFI_AP_URL      "http://192.168.4.1"
 
+/* Provisioning TX power in 0.25 dBm units: 40 = 10 dBm. Raise toward 80
+ * (20 dBm) only if the phone-to-device link is unreliable. */
+#define WIFI_TX_POWER_QDBM 40
+
 typedef enum {
     WIFI_MGR_MODE_AP = 0,
     WIFI_MGR_MODE_STA,
@@ -19,6 +23,13 @@ typedef void (*wifi_mgr_ready_cb_t)(void);
 esp_err_t wifi_mgr_start(void);
 wifi_mgr_mode_t wifi_mgr_mode(void);
 bool wifi_mgr_is_sta_up(void);
+bool wifi_mgr_is_ap_up(void);
+int wifi_mgr_ap_client_count(void);
+
+/* Stop the radio (and its beacons) for idle light sleep; restart the
+ * provisioning AP on wake. Both are safe to call repeatedly. */
+esp_err_t wifi_mgr_suspend(void);
+esp_err_t wifi_mgr_resume(void);
 esp_err_t wifi_mgr_get_ip(char *buf, size_t len);
 esp_err_t wifi_mgr_get_ssid(char *buf, size_t len);
 esp_err_t wifi_mgr_service_url(char *buf, size_t len);

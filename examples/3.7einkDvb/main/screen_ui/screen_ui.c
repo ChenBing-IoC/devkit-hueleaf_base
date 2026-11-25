@@ -123,6 +123,61 @@ static uint8_t pixel_at(const qr_stream_t *s, int x, int y)
     return SCREEN_COLOR_WHITE;
 }
 
+/* Six-leaf fan logo, drawn from the same column buffer as the text so it
+ * rotates with the rest of the provisioning page. */
+#define LOGO_LEAVES  6
+#define LOGO_LEN     112
+#define LOGO_HALF    20
+#define LOGO_REACH   130
+static const uint8_t k_logo_colors[LOGO_LEAVES] = {
+    SCREEN_COLOR_BLACK, SCREEN_COLOR_GREEN, SCREEN_COLOR_YELLOW,
+    SCREEN_COLOR_BLUE, SCREEN_COLOR_RED, SCREEN_COLOR_WHITE,
+};
+/* sin/cos of -1.375, -0.825, -0.275, 0.275, 0.825, 1.375 rad. */
+static const float k_leaf_sin[LOGO_LEAVES] = {
+    -0.980893f, -0.734548f, -0.271547f, 0.271547f, 0.734548f, 0.980893f,
+};
+static const float k_leaf_cos[LOGO_LEAVES] = {
+    0.194548f, 0.678557f, 0.962425f, 0.962425f, 0.678557f, 0.194548f,
+};
+
+static int logo_center_y(void)
+{
+    return ui_height * 28 / 100;
+}
+
+static uint8_t logo_pixel(int x, int y)
+{
+    const float dx = (float)(x - ui_width / 2);
+    const float dy = (float)(y - logo_center_y());
+    int filled = 0, outline = 0;
+    uint8_t color = SCREEN_COLOR_WHITE;
+
+    for (int i = 0; i < LOGO_LEAVES; ++i) {
+        const float s = k_leaf_sin[i], c = k_leaf_cos[i];
+        const float u = dx * s - dy * c;
+        const float v = dx * c + dy * s;
+        if (u < 0.0f || u > (float)LOGO_LEN) {
+            continue;
+        }
+        /* Parabolic half-width: pointed at the base and the tip. */
+        const float t = u / (float)LOGO_LEN;
+        const float w = (float)LOGO_HALF * 4.0f * t * (1.0f - t);
+        const float d = (v < 0.0f ? -v : v) - w;
+        if (d <= 0.0f) {
+            color = k_logo_colors[i];
+            filled = 1;
+        }
+        if (i == LOGO_LEAVES - 1 && d <= 1.5f && d >= -1.5f) {
+            outline = 1;   /* the white leaf is drawn as a black contour */
+        }
+    }
+    if (outline) {
+        return SCREEN_COLOR_BLACK;
+    }
+    return filled ? color : SCREEN_COLOR_WHITE;
+}
+
 static void paint_column(qr_stream_t *s, int x)
 {
     memset(s->col, SCREEN_COLOR_WHITE, SCREEN_HEIGHT);
@@ -130,6 +185,17 @@ static void paint_column(qr_stream_t *s, int x)
         draw_text_row(s->col, x, 240, "ready to setup", 4);
         draw_text_row(s->col, x, 340, "WiFi AP OPEN", 4);
         draw_text_row(s->col, x, 400, s->url, 3);
+        const int cx = ui_width / 2;
+        if (x >= cx - LOGO_REACH && x <= cx + LOGO_REACH) {
+            const int bottom = logo_center_y();
+            /* Extend past the base: the outer leaves tilt sideways, so their
+             * lower outline dips below the fan centre. */
+            for (int y = bottom - LOGO_LEN - 8; y <= bottom + LOGO_HALF + 10; ++y) {
+                if (y >= 0 && y < ui_height) {
+                    s->col[y] = logo_pixel(x, y);
+                }
+            }
+        }
         return;
     }
     for (int y = 0; y < ui_height; y++) {

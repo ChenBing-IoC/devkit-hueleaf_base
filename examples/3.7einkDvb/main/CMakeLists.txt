@@ -13,6 +13,7 @@ idf_component_register(
         "tf_card/tf_card.c"
         "wifi_mgr/wifi_mgr.c"
         "web_server/web_server.c"
+        "power_mgr/power_mgr.c"
     INCLUDE_DIRS
         "."
         "board"
@@ -26,14 +27,17 @@ idf_component_register(
         "tf_card"
         "wifi_mgr"
         "web_server"
+        "power_mgr"
     PRIV_REQUIRES
         json
         esp_driver_spi
         esp_driver_gpio
         esp_driver_i2c
         esp_common
+        esp_hw_support
         esp_partition
         esp_timer
+        esp_pm
         esp_wifi
         esp_netif
         esp_event

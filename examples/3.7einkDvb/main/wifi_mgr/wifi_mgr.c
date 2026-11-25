@@ -34,6 +34,8 @@ static char s_sta_ip[16];
 static char s_ssid[33];
 static char s_pass[65];
 static int s_retry;
+static volatile bool s_suspended;
+static int s_ap_clients;   /* accessed with __atomic_* from task + events */
 
 static void lock(void)
 {
@@ -121,8 +123,8 @@ static void apply_radio(void)
         ESP_LOGW(TAG, "ap proto: %s", esp_err_to_name(err));
     }
 #endif
-    (void)esp_wifi_set_ps(WIFI_PS_NONE);
-    (void)esp_wifi_set_max_tx_power(80);
+    (void)esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+    (void)esp_wifi_set_max_tx_power(WIFI_TX_POWER_QDBM);
 }
 
 static esp_err_t config_ap(void)
@@ -161,6 +163,7 @@ static esp_err_t start_apsta(void)
     if (err != ESP_OK && err != ESP_ERR_WIFI_CONN) return err;
     apply_radio();
     (void)config_ap();
+    s_suspended = false;
     s_ap_up = true;
     ESP_LOGI(TAG, "provision AP \"%s\"  open  %s", WIFI_AP_SSID, WIFI_AP_URL);
     return ESP_OK;
@@ -198,22 +201,29 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
 {
     (void)arg;
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
-        if (s_ssid[0]) {
+        if (!s_suspended && s_ssid[0]) {
             (void)esp_wifi_connect();
         }
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         s_sta_up = false;
         s_sta_ip[0] = 0;
-        if (s_ssid[0] && s_retry < 6) {
+        if (!s_suspended && s_ssid[0] && s_retry < 6) {
             s_retry++;
             ESP_LOGW(TAG, "STA retry %d", s_retry);
             (void)esp_wifi_connect();
-        } else if (s_events) {
+        } else if (!s_suspended && s_events) {
             xEventGroupSetBits(s_events, STA_FAIL_BIT);
         }
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_AP_STACONNECTED) {
         wifi_event_ap_staconnected_t *e = data;
+        (void)__atomic_add_fetch(&s_ap_clients, 1, __ATOMIC_RELAXED);
         ESP_LOGI(TAG, "phone " MACSTR " joined AP", MAC2STR(e->mac));
+    } else if (base == WIFI_EVENT && id == WIFI_EVENT_AP_STADISCONNECTED) {
+        wifi_event_ap_stadisconnected_t *e = data;
+        if (__atomic_sub_fetch(&s_ap_clients, 1, __ATOMIC_RELAXED) < 0) {
+            __atomic_store_n(&s_ap_clients, 0, __ATOMIC_RELAXED);
+        }
+        ESP_LOGI(TAG, "phone " MACSTR " left AP", MAC2STR(e->mac));
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *e = data;
         char ip[16];
@@ -250,7 +260,7 @@ esp_err_t wifi_mgr_start(void)
                                                         &wifi_event_handler, NULL, NULL));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
                                                         &wifi_event_handler, NULL, NULL));
-    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_MIN_MODEM));
 
     if (s_ssid[0]) {
         ESP_LOGI(TAG, "saved SSID \"%s\", try STA", s_ssid);
@@ -282,6 +292,72 @@ wifi_mgr_mode_t wifi_mgr_mode(void)
 bool wifi_mgr_is_sta_up(void)
 {
     return s_sta_up;
+}
+
+bool wifi_mgr_is_ap_up(void)
+{
+    return s_ap_up;
+}
+
+int wifi_mgr_ap_client_count(void)
+{
+    return __atomic_load_n(&s_ap_clients, __ATOMIC_RELAXED);
+}
+
+esp_err_t wifi_mgr_suspend(void)
+{
+    lock();
+    if (s_suspended) {
+        unlock();
+        return ESP_OK;
+    }
+    /* A phone may have associated after power_mgr's last poll; keep the AP. */
+    if (__atomic_load_n(&s_ap_clients, __ATOMIC_RELAXED) > 0) {
+        unlock();
+        return ESP_ERR_INVALID_STATE;
+    }
+    s_suspended = true;
+    s_ap_up = false;
+    s_sta_up = false;
+    unlock();
+    __atomic_store_n(&s_ap_clients, 0, __ATOMIC_RELAXED);
+
+    esp_err_t err = esp_wifi_stop();
+    if (err != ESP_OK && err != ESP_ERR_WIFI_NOT_STARTED) {
+        ESP_LOGW(TAG, "wifi stop: %s", esp_err_to_name(err));
+        lock();
+        s_suspended = false;
+        s_ap_up = true;   /* stop failed: the AP is most likely still running */
+        unlock();
+        return err;
+    }
+    ESP_LOGW(TAG, "Wi-Fi off for idle");
+    return ESP_OK;
+}
+
+esp_err_t wifi_mgr_resume(void)
+{
+    lock();
+    if (!s_suspended) {
+        unlock();
+        return ESP_OK;
+    }
+    s_retry = 0;
+    unlock();
+
+    /* start_apsta() clears s_suspended only once Wi-Fi is actually up, so a
+     * failed resume can be retried instead of looking already-resumed. */
+    esp_err_t err = start_apsta();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "AP restart: %s", esp_err_to_name(err));
+        return err;
+    }
+    if (s_ssid[0]) {
+        (void)config_sta(s_ssid, s_pass);
+        (void)esp_wifi_connect();
+    }
+    ESP_LOGI(TAG, "Wi-Fi resumed");
+    return ESP_OK;
 }
 
 esp_err_t wifi_mgr_get_ip(char *buf, size_t len)

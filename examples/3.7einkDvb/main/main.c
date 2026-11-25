@@ -8,6 +8,7 @@
 #include "pcf8563.h"
 #include "msa321.h"
 #include "pin_map.h"
+#include "power_mgr.h"
 #include "screen_driver.h"
 #include "screen_ui.h"
 #include "screen_rotation.h"
@@ -174,6 +175,7 @@ void app_main(void)
     ESP_ERROR_CHECK(screen_rotation_init());
     ESP_ERROR_CHECK(wifi_mgr_start());
     ESP_ERROR_CHECK(web_server_start());
+    ESP_ERROR_CHECK(power_mgr_init());
     if (xTaskCreate(screen_task, "screen_ui", 4096, NULL, 3, &s_screen_task) != pdPASS) {
         ESP_LOGE(TAG, "screen task; PWRON clear unavailable");
         show_network_page();

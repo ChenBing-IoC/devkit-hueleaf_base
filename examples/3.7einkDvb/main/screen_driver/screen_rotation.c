@@ -4,6 +4,7 @@
 #include "screen_ui.h"
 
 #include "web_server.h"
+#include "power_mgr.h"
 #include "esp_log.h"
 #include "esp_partition.h"
 #include "freertos/FreeRTOS.h"
@@ -15,6 +16,7 @@
 static const char *TAG = "rotation";
 static SemaphoreHandle_t s_lock;
 static TaskHandle_t s_worker;
+static TaskHandle_t s_button_task;
 static unsigned s_rotation = EINK_ROTATION;
 static uint32_t s_epoch = 1, s_pending;
 static bool s_working, s_ui_current;
@@ -302,6 +304,16 @@ static void rotation_button(void *arg)
     TickType_t changed = xTaskGetTickCount();
     bool armed = false; /* Ignore a BOOT button still held during power-on. */
     for (;;) {
+        if (power_mgr_is_suspended()) {
+            /* Park until power_mgr wakes us; a 10 ms poll would otherwise
+             * keep waking the chip out of light sleep every tick. */
+            (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+            raw = gpio_get_level(EINK_ROTATE_BUTTON);
+            stable = raw;
+            changed = xTaskGetTickCount();
+            armed = false;
+            continue;
+        }
         vTaskDelay(pdMS_TO_TICKS(10));
         const int value = gpio_get_level(EINK_ROTATE_BUTTON);
         const TickType_t now = xTaskGetTickCount();
@@ -334,9 +346,10 @@ esp_err_t screen_rotation_init(void)
     if (xTaskCreate(rotation_worker, "rotate_ui", 4096, NULL, 3, &s_worker) != pdPASS) {
         vSemaphoreDelete(s_lock); s_lock = NULL; return ESP_ERR_NO_MEM;
     }
-    if (xTaskCreate(rotation_button, "rotate_key", 2048, NULL, 2, NULL) != pdPASS) {
+    if (xTaskCreate(rotation_button, "rotate_key", 2048, NULL, 2, &s_button_task) != pdPASS) {
         vTaskDelete(s_worker); s_worker = NULL; vSemaphoreDelete(s_lock); s_lock = NULL; return ESP_ERR_NO_MEM;
     }
+    power_mgr_register_button_task(s_button_task);
     ESP_LOGI(TAG, "GPIO%d rotate button ready, default=%u cache=%s",
         (int)EINK_ROTATE_BUTTON, screen_rotation_get(), s_partition ? "flash" : "unavailable");
     return ESP_OK;
