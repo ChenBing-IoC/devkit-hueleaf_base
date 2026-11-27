@@ -9,8 +9,12 @@
 #include "driver/sdspi_host.h"
 #include "esp_log.h"
 #include "esp_vfs_fat.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "pin_map.h"
+#include "screen_rotation.h"
 #include "sdmmc_cmd.h"
+#include "web_server.h"
 
 static const char *TAG = "tf";
 
@@ -70,10 +74,12 @@ esp_err_t tf_card_mount(void)
     esp_err_t err = esp_vfs_fat_sdspi_mount(TF_CARD_MOUNT_POINT, &host, &slot, &mount, &s_card);
     if (err == ESP_OK) {
         (void)mkdir(TF_CARD_NFC_DIR, 0777);
+        (void)mkdir(TF_CARD_EINK_DIR, 0777);
     }
     board_spi_unlock();
 
     if (err != ESP_OK) {
+        s_card = NULL;
         board_tf_cs_idle();
         ESP_LOGW(TAG, "mount failed: %s  (FAT32 TF on CS=%d)",
                  esp_err_to_name(err), (int)spi2_tf_cs);
@@ -93,6 +99,58 @@ esp_err_t tf_card_mount(void)
 bool tf_card_is_mounted(void)
 {
     return s_mounted;
+}
+
+void tf_card_wait_idle(void)
+{
+    /* One six-ink refresh owns the shared SPI bus for ~23 s. Mounting or
+     * unmounting in the middle of it would stall the panel transfer, so wait
+     * for the screen to go idle first. The cap keeps a stuck job from hanging
+     * the caller forever; the bus lock still serialises the actual access. */
+    const TickType_t start = xTaskGetTickCount();
+    while (web_server_screen_busy() || screen_rotation_busy()) {
+        if ((xTaskGetTickCount() - start) > pdMS_TO_TICKS(60000)) {
+            ESP_LOGW(TAG, "screen still busy after 60 s, touching the card anyway");
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+}
+
+esp_err_t tf_card_ensure_mounted(void)
+{
+    if (s_mounted) {
+        return ESP_OK;
+    }
+    tf_card_wait_idle();
+    /* A failed mount leaves s_mounted false, so the next call retries. */
+    return tf_card_mount();
+}
+
+esp_err_t tf_card_unmount(void)
+{
+    /* Close a half-written dump first: end_write also releases the SPI lock. */
+    (void)tf_card_end_write();
+    if (!s_mounted && s_card == NULL) {
+        return ESP_OK;
+    }
+
+    board_spi_lock();
+    esp_err_t err = ESP_OK;
+    if (s_card != NULL) {
+        err = esp_vfs_fat_sdcard_unmount(TF_CARD_MOUNT_POINT, s_card);
+    }
+    board_spi_unlock();
+
+    s_mounted = false;
+    s_card = NULL;
+    board_tf_cs_idle();
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "unmounted %s, CS idle", TF_CARD_MOUNT_POINT);
+    } else {
+        ESP_LOGW(TAG, "unmount: %s", esp_err_to_name(err));
+    }
+    return err;
 }
 
 esp_err_t tf_card_write_text(const char *path, const char *text, bool append)

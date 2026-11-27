@@ -545,6 +545,22 @@ esp_err_t screen_rotation_preview(int index, uint8_t *rgba, int width, int heigh
     return ESP_OK;
 }
 
+esp_err_t screen_rotation_read_frame(int index, size_t offset, uint8_t *buffer, size_t length)
+{
+    if (!s_partition || index < 0 || index >= CACHE_SLOTS || !s_slots[index].valid) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (s_slots[index].bytes != (size_t)SCREEN_FRAME_BYTES) {
+        /* Only single-plane OTP6 slots are exported as a raw six-ink frame. */
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!buffer || offset > (size_t)SCREEN_FRAME_BYTES ||
+        length > (size_t)SCREEN_FRAME_BYTES - offset) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return esp_partition_read(s_partition, slot_data_base(index) + offset, buffer, length);
+}
+
 esp_err_t screen_rotation_toggle_blank(void)
 {
     if (screen_rotation_hidden()) {

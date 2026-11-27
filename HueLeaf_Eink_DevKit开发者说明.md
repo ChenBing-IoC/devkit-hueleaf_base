@@ -111,7 +111,7 @@ SPI 主机为 SPI2。板级代码将共享总线访问串行化；自行添加 S
 | ACTIVE | 上电、按键唤醒、维护唤醒被按键升级后 | Wi-Fi 与 HTTP 服务正常；每次网页请求、按键操作、屏幕任务都会刷新活动时间戳 |
 | LOW_POWER（深睡） | 无热点客户端，且距上次活动超过 `POWER_IDLE_TIMEOUT_MS`（默认 2 分钟），策略选择深睡（电池供电且「自动」、或「强制深睡」） | 调用 `wifi_mgr_suspend()` 关闭 SoftAP、停止 Wi-Fi 射频；去掉画面底部 IP 小字并切换到下一张缓存图片（无图片时显示 LOW POWER 提示）；把系统时间写回 PCF8563；`esp_deep_sleep_start()`，由 RTC 定时器按 `interval_min` 唤醒 |
 | LOW_POWER（浅睡） | 同上但策略选择浅睡（插 USB 且「自动」、或「仅浅睡」） | 旧行为：MCU 每 `POWER_SLEEP_POLL_MS`（默认 500 ms）以轻睡眠定时唤醒，通过 I²C 读取 AXP2101 中断状态判断电源键单击 |
-| MAINTENANCE | 定时器唤醒（`ESP_SLEEP_WAKEUP_TIMER`）且没有锁存的电源键事件 | 不开热点；有 STA 凭据时只连 STA（10 秒上限），SNTP 校时并写回 PCF8563、记录电量，运行唤醒任务钩子；不碰屏幕；整段 45 秒上限，随后继续深睡 |
+| MAINTENANCE | 定时器唤醒（`ESP_SLEEP_WAKEUP_TIMER`）且没有锁存的电源键事件 | 不开热点；有 STA 凭据时只连 STA（10 秒上限），SNTP 校时并写回 PCF8563、记录电量，并尝试向 TF 卡 `/sdcard/log/power.csv` 追加一行（挂载+写入+卸载限 3 秒，卡不在则跳过），运行唤醒任务钩子；不碰屏幕；整段 45 秒上限，随后继续深睡 |
 | OFF | 定时唤醒关闭时低功耗持续 `POWER_AUTO_OFF_MS`（默认 30 分钟）且未接 USB；或未接 USB 且电量有效低于 `POWER_BATT_CUTOFF_PCT`（默认 5%） | 写 AXP2101 `COMMON_CONFIG` bit0 软件关机，DCDC/LDO 全部关断，仅 PWRON 可重新开机 |
 
 要点：
@@ -121,9 +121,9 @@ SPI 主机为 SPI2。板级代码将共享总线访问串行化；自行添加 S
 - 唤醒原因在 `app_main` 一开始由 `power_mgr_boot_init()` 分类：`ESP_SLEEP_WAKEUP_TIMER` 走维护会话；`EXT1`、`GPIO` 或上电、复位走交互会话。`ESP_SLEEP_WAKEUP_GPIO` 且 `esp_sleep_get_gpio_wakeup_status()` 掩码含 GPIO4 时日志记为 `motion wake`，同样按交互会话处理（开 AP、加 IP 小字、重新 2 分钟计时）。定时唤醒后第一时间读 AXP2101 短按状态，若睡眠期间按过电源键（事件被 PMIC 锁存）则把本次会话升级为交互唤醒。
 - 深睡唤醒源在启动时用 `esp_sleep_is_valid_wakeup_gpio()` 自检 GPIO25/4/28/23 并打印 `deep wake pins:` 日志。ESP32-C5 只有 LP 域 GPIO（0~6）能做深睡唤醒源；GPIO25 有效时用 `ESP_EXT1_WAKEUP_ALL_LOW` 单脚唤醒，无效时降级为纯定时器唤醒 + 锁存按键升级，`/api/power` 的 `deep_ok` 反映实际能力。GPIO4（IMU INT1）在中断寄存器表可用时额外用 `esp_deep_sleep_enable_gpio_wakeup()` arm 为高电平唤醒源；不可用或 arm 失败时只保留定时器/电源键，睡眠流程不受影响。
 - 浅睡轮询使用 `esp_light_sleep_start()` + 定时唤醒；深睡则完全断电重启，靠 PCF8563 保时（开机 `pcf8563_restore_system_time()` 只向前调表，SNTP 成功后 `pcf8563_save_system_time()` 写回）。
-- 两种睡眠都在 `power_mgr` 持有 `screen_rotation` 锁、且 `web_server_screen_busy()` / `screen_rotation_busy()` 为假之后才进入，避免 SPI/Flash 任务与睡眠重叠。浅睡会冻结负责喂狗的空闲任务，因此进入低功耗前用 `esp_task_wdt_reconfigure()` 暂停任务看门狗，唤醒后按原配置恢复，避免长睡眠触发 TWDT。
+- 两种睡眠都在 `power_mgr` 持有 `screen_rotation` 锁、且 `web_server_screen_busy()` / `screen_rotation_busy()` 为假之后才进入，避免 SPI/Flash 任务与睡眠重叠。浅睡会冻结负责喂狗的空闲任务，因此进入低功耗前用 `esp_task_wdt_reconfigure()` 暂停任务看门狗，唤醒后按原配置恢复，避免长睡眠触发 TWDT。进入低功耗前（`enter_low_power()` 与 `power_mgr_deep_sleep()` 两条路径）都会调用 `tf_card_unmount()` 卸载 TF 卡并释放片选，避免 SD 卡与 SPI 上拉在睡眠中耗电；网页访问 TF 接口时 `tf_card_ensure_mounted()` 按需重新挂载。挂载、卸载都在 `board_spi_lock()` 保护下，且等 `web_server_screen_busy()` / `screen_rotation_busy()` 为假，不会与约 23 秒的整屏刷新重叠。
 - 画面底部的白底黑字小字（`AP 192.168.4.1` 或 `STA <ip>`）只在工作状态显示，由驱动在 SPI 发送前临时叠加，不会写入图片缓存；进入低功耗时先清掉小字，再按槽位顺序刷新下一张图片，因此「有无 IP 小字」就是低功耗状态的直观指示，待机画面仍是完整无水印的一张图。屏幕被电源键刷白（清屏）时保持白屏，不参与切换。
-- 三个图片槽位保存在 `image_cache` 分区，掉电不丢；网页上传可指定槽位（`X-Eink-Slot`），页面通过 `/api/slots`、`/api/slot?i=N` 显示三个槽位的缩略图。
+- 三个图片槽位保存在 `image_cache` 分区，掉电不丢；网页上传可指定槽位（`X-Eink-Slot`），页面通过 `/api/slots`、`/api/slot?i=N` 显示三个槽位的缩略图。「图片」页的「TF 卡内容库」通过 `GET /api/tf` 列出 `/sdcard/eink/` 中 172800 字节的裸六色帧，`POST /api/tf/import` 与 `POST /api/tf/export` 经作业系统（`JOB_TF_IMPORT` / `JOB_TF_EXPORT`）在作业任务里持 rotation 锁读写槽位与 FAT；HTTP 立即返回 202，前端轮询 `/api/job`，不在处理函数里做 23 秒刷新或大文件循环。
 - 加速度计在唤醒状态由 `imu_app` 以约 15 Hz 轮询：Z 轴符号翻转并稳定 300 ms 视为翻面，两次冲击间隔小于 400 ms 视为双击，两者都复用 `screen_rotation_show_next(true)` 换下一张图并重置 2 分钟计时；800 ms 去抖避免走路连翻。`GET /api/imu` 返回最近三轴加速度、朝向、翻面/双击计数和深睡唤醒能力。
 - 固件内置三张 480 × 720 六色示例帧（`main/screen_driver/defaults/pic*.bin`，由 `demo_images/pack_default_frames.py` 从示范 PNG 生成）。`screen_rotation_init()` 发现三个槽位都无效时会把它们写入缓存，因此新机器或旧缓存格式升级后开机即可显示图片而不是配网文字；已有有效图片的设备不会被覆盖。
 - 充电时（`axp2101_is_usb_connected()` 为真）「自动」策略只降功耗到浅睡、不深睡也不自动关机，避免 USB 调试和充电过程中意外断电；「强制深睡」则无视 USB。
@@ -159,9 +159,9 @@ idf.py -p COMx flash monitor
 | Wi-Fi 配网 | `main/wifi_mgr/` | SoftAP 初始开放网络名为 `Eink E6 3.7`，访问 `http://192.168.4.1`；配置 STA 后切换到局域网地址；提供 `wifi_mgr_suspend()` / `wifi_mgr_resume()` 供低功耗使用，`wifi_mgr_sta_start()` 供定时维护唤醒只连 STA |
 | 低功耗管理 | `main/power_mgr/` | 2 分钟无网络活动关闭 AP：电池供电深睡 + 定时唤醒（维护会话只校时、不刷屏），插 USB 保持浅睡；电源键唤醒重开 AP；定时唤醒关闭时保留 30 分钟关机，另有 5% 电量保护 |
 | Web 屏幕服务 | `main/web_server/` | 浏览器端图像上传和设备状态接口 |
-| TF 卡 | `main/tf_card/` | 与屏幕共用 SPI2；以 FAT 文件系统挂载到 `/sdcard`，不自动格式化卡 |
+| TF 卡 | `main/tf_card/` | 与屏幕共用 SPI2；以 FAT 文件系统按需挂载到 `/sdcard`，进入低功耗前卸载，不自动格式化卡；内容库目录 `/sdcard/eink`，维护日志 `/sdcard/log/power.csv` |
 | PMIC | `main/pmic/axp2101.c` | 初始化电源管理、读取电池/充电状态和电源键事件 |
-| RTC | `main/rtc/pcf8563.c` | 当前初始化会将 RTC 写为固件编译时间并回读；不是网络校时 |
+| RTC | `main/rtc/pcf8563.c` | 掉电保时；开机读取 RTC 灌入系统时钟（只向前调），SNTP 校时成功后写回；仅在 VL 置位或读数不合理时才用编译时间初始化 |
 | IMU | `main/imu/msa321.c`、`main/imu/imu_app.c` | `msa321.c` 以 ±4 g、125 Hz 配置并提供 any-motion 中断接口（寄存器表待手册核对）；`imu_app.c` 醒着时约 15 Hz 采样，识别翻面/双击换图，经 `/api/imu` 暴露状态，并向 `power_mgr` 提供深睡运动唤醒的 arm/clear |
 
 SoftAP 当前配置为开放网络，仅建议在受控开发环境中使用。开发网页服务时注意该 AP 没有密码保护。
@@ -170,7 +170,7 @@ SoftAP 当前配置为开放网络，仅建议在受控开发环境中使用。�
 
 - 屏幕和 TF 卡共享 SPI2。并行访问需遵循板级 SPI 锁和独立片选管理，避免在文件操作期间直接操作另一设备。
 - PMIC、IMU 和 RTC 共用 I²C0。不要重复初始化相同 GPIO 的独立 I²C 控制器；添加设备时沿用共享总线并加锁。
-- TF 卡初始化失败不会自动格式化介质；确认 FAT 文件系统、卡片和 CS 连接后再排查。
+- TF 卡初始化失败不会自动格式化介质；确认 FAT 文件系统、卡片和 CS 连接后再排查。内容库只接受 `/sdcard/eink/` 下正好 172800 字节的裸六色帧；导出文件名只允许字母、数字与 `_ . -`，导入按 `/sdcard/eink/<name>` 拼接并拒绝 `/`、`\`、`..`。
 - PCF8563 只在首次使用（VL 置位或读数不合理）时写入编译时间，之后开机读取并灌入系统时钟，SNTP 校时成功后写回；调试时注意不要用编译时间覆盖现场走时。
 - 出货版本不具备 NFC 功能。扩展其他外设时，分配 GPIO 前请检查启动绑带、板上连线和当前固件占用，避免影响启动或已有功能。
 - 电池容量为 500 mAh，标称电压 3.7 V。涉及充电、电池保护或续航评估时，应结合实际使用工况和电源管理配置验证。

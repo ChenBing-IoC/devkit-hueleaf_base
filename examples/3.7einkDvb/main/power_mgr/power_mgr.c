@@ -1,6 +1,9 @@
 #include "power_mgr.h"
 
 #include <stdio.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <time.h>
 #include "axp2101.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
@@ -18,6 +21,7 @@
 #include "pin_map.h"
 #include "screen_rotation.h"
 #include "screen_ui.h"
+#include "tf_card.h"
 #include "web_server.h"
 #include "wifi_mgr.h"
 
@@ -33,6 +37,8 @@ static const char *TAG = "power";
 #define POWER_NVS_INTERVAL   "interval_min"
 #define POWER_NVS_MODE       "mode"
 #define POWER_SNTP_SERVER    "pool.ntp.org"
+/* Mount + append + unmount must fit here; a missing or slow card is skipped. */
+#define POWER_LOG_BUDGET_US  (3 * 1000 * 1000)
 
 #if CONFIG_ESP_TASK_WDT_EN
 #if CONFIG_ESP_TASK_WDT_PANIC
@@ -332,6 +338,11 @@ esp_err_t power_mgr_deep_sleep(void)
         screen_rotation_lock();
     }
 
+    /* Drop the SD card and its SPI pull-ups for the whole sleep. The next web
+     * access to a TF endpoint mounts it again on demand. The rotation lock is
+     * held and no refresh is running, so this cannot overlap a panel transfer. */
+    (void)tf_card_unmount();
+
     const int soc = axp2101_battery_percent();
     if (soc >= 0 && soc < POWER_BATT_CUTOFF_PCT && !axp2101_is_usb_connected()) {
         ESP_LOGW(TAG, "battery %d%%: power off instead of sleeping", soc);
@@ -449,6 +460,55 @@ static bool maintenance_sntp(uint64_t budget_ms)
     return synced;
 }
 
+/* One CSV row per timer wake. Mounting and unmounting stay inside a 3 s budget
+ * so a missing card never eats into the 45 s maintenance session. */
+static void maintenance_log(void)
+{
+    const int64_t start_us = esp_timer_get_time();
+    if (tf_card_ensure_mounted() != ESP_OK) {
+        ESP_LOGI(TAG, "power log: no card, skipped");
+        return;
+    }
+    if (esp_timer_get_time() - start_us > POWER_LOG_BUDGET_US) {
+        ESP_LOGW(TAG, "power log: mount over budget, skipped");
+        (void)tf_card_unmount();
+        return;
+    }
+
+    (void)mkdir(TF_CARD_LOG_DIR, 0777);
+    bool need_header = true;
+    struct stat st;
+    if (stat(TF_CARD_POWER_LOG, &st) == 0 && st.st_size > 0) {
+        need_header = false;
+    }
+
+    char stamp[24] = "unknown";
+    const time_t now = time(NULL);
+    struct tm tm_utc;
+    if (now > 0 && gmtime_r(&now, &tm_utc) != NULL) {
+        if (strftime(stamp, sizeof(stamp), "%Y-%m-%dT%H:%M:%SZ", &tm_utc) == 0) {
+            strlcpy(stamp, "unknown", sizeof(stamp));
+        }
+    }
+
+    /* Build with strlcat: the compiler cannot bound %s of a runtime name and
+     * -Wformat-truncation would fail the build under -Werror. */
+    char row[192];
+    row[0] = 0;
+    if (need_header) strlcpy(row, "utc,battery_pct,usb,wake\n", sizeof(row));
+    strlcat(row, stamp, sizeof(row));
+    char numbers[48];
+    snprintf(numbers, sizeof(numbers), ",%d,%d,",
+             axp2101_battery_percent(), axp2101_is_usb_connected() ? 1 : 0);
+    strlcat(row, numbers, sizeof(row));
+    strlcat(row, power_mgr_last_wake_name(), sizeof(row));
+    strlcat(row, "\n", sizeof(row));
+    const esp_err_t err = tf_card_write_text(TF_CARD_POWER_LOG, row, true);
+    ESP_LOGI(TAG, "power log %s (%lld ms)", esp_err_to_name(err),
+             (long long)((esp_timer_get_time() - start_us) / 1000));
+    (void)tf_card_unmount();
+}
+
 void power_mgr_maintenance_session(void)
 {
     const int64_t start_us = esp_timer_get_time();
@@ -487,6 +547,9 @@ void power_mgr_maintenance_session(void)
         }
         (void)wifi_mgr_suspend();
     }
+
+    /* Optional, best effort, and always after the clock had its chance. */
+    maintenance_log();
 
     const int64_t used_ms = (esp_timer_get_time() - start_us) / 1000;
     if (used_ms >= POWER_MAINT_TOTAL_MS) {
@@ -661,6 +724,10 @@ static void enter_low_power(void)
         show_low_power_page();
     }
     screen_rotation_unlock();
+
+    /* Low power, light or deep, keeps the slot unpowered. The panel work above
+     * is finished, so the unmount cannot race a refresh. */
+    (void)tf_card_unmount();
 
     if (deep_sleep_selected()) {
         esp_err_t sleep_err = power_mgr_deep_sleep();

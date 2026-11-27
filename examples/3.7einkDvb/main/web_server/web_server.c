@@ -8,6 +8,9 @@
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
+#include <dirent.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include "axp2101.h"
 #include "esp_check.h"
 #include "esp_heap_caps.h"
@@ -21,19 +24,24 @@
 #include "imu_app.h"
 #include "screen_driver.h"
 #include "screen_ui.h"
+#include "tf_card.h"
 #include "wifi_mgr.h"
 #include "lwip/sockets.h"
 
 static const char *TAG = "web";
 
 typedef enum { JOB_IDLE, JOB_REFRESH, JOB_RECEIVING, JOB_ERROR } job_phase_t;
-typedef enum { JOB_FRAME, JOB_CLEAR_SCREEN } job_kind_t;
+typedef enum { JOB_FRAME, JOB_CLEAR_SCREEN, JOB_TF_IMPORT, JOB_TF_EXPORT } job_kind_t;
 #define FRAME_FORMAT "otp6-v1"
 #define FRAME_CHUNK_BYTES 2048
 #define SLOT_COUNT 3
 #define THUMB_WIDTH 60
 #define THUMB_HEIGHT 90
 #define THUMB_BYTES (THUMB_WIDTH * THUMB_HEIGHT * 4)
+#define TF_LIST_MAX 64
+#define TF_NAME_MAX 64
+#define TF_CHUNK_BYTES 2048
+#define TF_JSON_BYTES 8192
 
 static portMUX_TYPE s_job_lock = portMUX_INITIALIZER_UNLOCKED;
 static volatile job_phase_t s_job_phase = JOB_IDLE;
@@ -53,6 +61,11 @@ typedef struct {
     int slot;                              /* -1 = the next slot in the cycle */
 } frame_rx_t;
 static frame_rx_t s_pending;
+typedef struct {
+    char name[TF_NAME_MAX + 1];
+    int slot;
+} tf_pending_t;
+static tf_pending_t s_tf_pending;
 
 static void log_heap_stats(const char *event, uint32_t id)
 {
@@ -71,7 +84,21 @@ static esp_err_t send_json(httpd_req_t *req, const char *json);
 static void frame_job_task(void *arg);
 static const char *job_kind_name(job_kind_t kind)
 {
-    return kind == JOB_CLEAR_SCREEN ? "clear-screen" : "frame";
+    switch (kind) {
+    case JOB_CLEAR_SCREEN: return "clear-screen";
+    case JOB_TF_IMPORT: return "tf-import";
+    case JOB_TF_EXPORT: return "tf-export";
+    default: return "frame";
+    }
+}
+static const char *job_sequence(job_kind_t kind)
+{
+    switch (kind) {
+    case JOB_CLEAR_SCREEN: return "otp6-clear-v1";
+    case JOB_TF_IMPORT: return "tf-import-v1";
+    case JOB_TF_EXPORT: return "tf-export-v1";
+    default: return FRAME_FORMAT;
+    }
 }
 static const char *job_phase_name(job_phase_t phase)
 {
@@ -107,6 +134,20 @@ static void finish_job(esp_err_t err, const screen_upload_report_t *report)
     s_job_err = err;
     s_job_phase = err == ESP_OK ? JOB_IDLE : JOB_ERROR;
     s_job_step = err == ESP_OK ? "done" : "error";
+    portEXIT_CRITICAL(&s_job_lock);
+}
+static void set_job_progress(size_t bytes, const char *step)
+{
+    portENTER_CRITICAL(&s_job_lock);
+    s_job_bytes = bytes;
+    s_job_step = step;
+    portEXIT_CRITICAL(&s_job_lock);
+}
+static void set_job_phase(job_phase_t phase, const char *step)
+{
+    portENTER_CRITICAL(&s_job_lock);
+    s_job_phase = phase;
+    s_job_step = step;
     portEXIT_CRITICAL(&s_job_lock);
 }
 
@@ -147,8 +188,7 @@ static esp_err_t send_job_json(httpd_req_t *req)
         (unsigned)id, job_phase_name(phase), (int)err, job_kind_name(kind), step,
         (unsigned)bytes, (unsigned)report.total_ms, (unsigned)report.refresh_ms,
         (unsigned)report.display_generation, (unsigned)screen_driver_generation());
-    return send_report_json(req, json, sizeof(json), used, &report,
-        kind == JOB_CLEAR_SCREEN ? "otp6-clear-v1" : FRAME_FORMAT);
+    return send_report_json(req, json, sizeof(json), used, &report, job_sequence(kind));
 }
 
 extern const uint8_t index_html_start[]        asm("_binary_index_html_start");
@@ -561,12 +601,378 @@ static void ip_strip_decorate(void *context, uint8_t *buffer, size_t offset, siz
     }
 }
 
+/* ---- TF content library -------------------------------------------------- */
+
+static bool tf_import_name_ok(const char *name)
+{
+    const size_t len = name ? strlen(name) : 0;
+    if (len == 0 || len > TF_NAME_MAX) return false;
+    if (!strcmp(name, ".") || !strcmp(name, "..")) return false;
+    /* Only the export side restricts the alphabet; an import may use any name
+     * already on the card as long as it cannot escape /sdcard/eink. */
+    return strchr(name, '/') == NULL && strchr(name, '\\') == NULL;
+}
+
+static bool tf_export_name_ok(const char *name)
+{
+    const size_t len = name ? strlen(name) : 0;
+    if (len == 0 || len > TF_NAME_MAX) return false;
+    if (!strcmp(name, ".") || !strcmp(name, "..")) return false;
+    for (size_t i = 0; i < len; ++i) {
+        const char c = name[i];
+        const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                        (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+static bool tf_path(char *dst, size_t capacity, const char *name)
+{
+    const size_t dir = strlen(TF_CARD_EINK_DIR);
+    const size_t len = name ? strlen(name) : 0;
+    if (!name || len == 0 || dir + 1 + len + 1 > capacity) return false;
+    memcpy(dst, TF_CARD_EINK_DIR, dir);
+    dst[dir] = '/';
+    memcpy(dst + dir + 1, name, len + 1);
+    return true;
+}
+
+static esp_err_t read_json_body(httpd_req_t *req, char *body, size_t capacity)
+{
+    if (req->content_len == 0 || req->content_len >= capacity) return ESP_ERR_INVALID_SIZE;
+    size_t used = 0;
+    while (used < req->content_len) {
+        const int n = httpd_req_recv(req, body + used, req->content_len - used);
+        if (n <= 0) return ESP_FAIL;
+        used += (size_t)n;
+    }
+    body[used] = 0;
+    return ESP_OK;
+}
+
+static int append_lit(char *dst, size_t capacity, int used, const char *lit)
+{
+    if (used < 0) return -1;
+    const size_t n = strlen(lit);
+    if ((size_t)used + n + 1 > capacity) return -1;
+    memcpy(dst + used, lit, n + 1);
+    return used + (int)n;
+}
+
+static int append_json_name(char *dst, size_t capacity, int used, const char *src)
+{
+    if (used < 0 || (size_t)used + 2 > capacity) return -1;
+    dst[used++] = '"';
+    for (const char *p = src; *p; ++p) {
+        char out[2] = { *p, 0 };
+        if (*p == '"' || *p == '\\') {
+            out[0] = '\\';
+            out[1] = *p;
+        } else if ((unsigned char)*p < 0x20) {
+            out[0] = '_';
+            out[1] = 0;
+        }
+        const size_t n = strlen(out);
+        if ((size_t)used + n + 2 > capacity) return -1;
+        memcpy(dst + used, out, n);
+        used += (int)n;
+    }
+    dst[used++] = '"';
+    dst[used] = 0;
+    return used;
+}
+
+typedef struct {
+    char name[TF_NAME_MAX + 1];
+    unsigned size;
+    bool valid;
+} tf_entry_t;
+
+static tf_entry_t s_tf_entries[TF_LIST_MAX];
+static char s_tf_json[TF_JSON_BYTES];
+static uint8_t s_tf_chunk[TF_CHUNK_BYTES];
+
+static int tf_entry_cmp(const void *a, const void *b)
+{
+    return strcmp(((const tf_entry_t *)a)->name, ((const tf_entry_t *)b)->name);
+}
+
+static esp_err_t tf_get_handler(httpd_req_t *req)
+{
+    power_mgr_note_activity();
+    if (web_server_screen_busy() || screen_rotation_busy()) {
+        httpd_resp_set_status(req, "409 Conflict");
+        return send_json(req, "{\"ok\":false,\"error\":\"screen busy\"}");
+    }
+    if (tf_card_ensure_mounted() != ESP_OK) {
+        return send_json(req, "{\"ok\":true,\"present\":false,\"mounted\":false,\"files\":[]}");
+    }
+
+    unsigned count = 0;
+    (void)mkdir(TF_CARD_EINK_DIR, 0777);
+    DIR *dir = opendir(TF_CARD_EINK_DIR);
+    if (dir != NULL) {
+        struct dirent *ent;
+        while (count < TF_LIST_MAX && (ent = readdir(dir)) != NULL) {
+            if (!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, "..")) continue;
+            const size_t len = strlen(ent->d_name);
+            if (len == 0 || len > TF_NAME_MAX) continue;
+            char path[sizeof(TF_CARD_EINK_DIR) + TF_NAME_MAX + 2];
+            if (!tf_path(path, sizeof(path), ent->d_name)) continue;
+            struct stat st;
+            if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) continue;
+            tf_entry_t *e = &s_tf_entries[count];
+            memcpy(e->name, ent->d_name, len + 1);
+            e->size = (unsigned)st.st_size;
+            e->valid = st.st_size == SCREEN_FRAME_BYTES;
+            ++count;
+        }
+        closedir(dir);
+    }
+    qsort(s_tf_entries, count, sizeof(s_tf_entries[0]), tf_entry_cmp);
+
+    int used = append_lit(s_tf_json, sizeof(s_tf_json), 0,
+        "{\"ok\":true,\"present\":true,\"mounted\":true,\"files\":[");
+    for (unsigned i = 0; i < count && used >= 0; ++i) {
+        char size_text[16];
+        const int n = snprintf(size_text, sizeof(size_text), "%u", s_tf_entries[i].size);
+        if (n < 0 || (size_t)n >= sizeof(size_text)) { used = -1; break; }
+        if (i) used = append_lit(s_tf_json, sizeof(s_tf_json), used, ",");
+        used = append_lit(s_tf_json, sizeof(s_tf_json), used, "{\"name\":");
+        used = append_json_name(s_tf_json, sizeof(s_tf_json), used, s_tf_entries[i].name);
+        used = append_lit(s_tf_json, sizeof(s_tf_json), used, ",\"size\":");
+        used = append_lit(s_tf_json, sizeof(s_tf_json), used, size_text);
+        used = append_lit(s_tf_json, sizeof(s_tf_json), used, ",\"valid\":");
+        used = append_lit(s_tf_json, sizeof(s_tf_json), used,
+                          s_tf_entries[i].valid ? "true" : "false");
+        used = append_lit(s_tf_json, sizeof(s_tf_json), used, "}");
+    }
+    if (used >= 0) used = append_lit(s_tf_json, sizeof(s_tf_json), used, "]}");
+    if (used < 0) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "tf list overflow");
+        return ESP_FAIL;
+    }
+    return send_json(req, s_tf_json);
+}
+
+static esp_err_t tf_import_post_handler(httpd_req_t *req)
+{
+    power_mgr_note_activity();
+    char body[192];
+    if (read_json_body(req, body, sizeof(body)) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "body size");
+        return ESP_FAIL;
+    }
+    cJSON *root = cJSON_ParseWithOpts(body, NULL, true);
+    const cJSON *file = cJSON_GetObjectItemCaseSensitive(root, "file");
+    const cJSON *slot = cJSON_GetObjectItemCaseSensitive(root, "slot");
+    const bool valid = cJSON_IsObject(root) && cJSON_IsString(file) &&
+        tf_import_name_ok(file->valuestring) && cJSON_IsNumber(slot) &&
+        slot->valueint >= 0 && slot->valueint < SLOT_COUNT &&
+        (double)slot->valueint == slot->valuedouble;
+    char name[TF_NAME_MAX + 1];
+    int target = 0;
+    if (valid) {
+        memcpy(name, file->valuestring, strlen(file->valuestring) + 1);
+        target = slot->valueint;
+    }
+    cJSON_Delete(root);
+    if (!valid) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "file and slot 0..2 required");
+        return ESP_FAIL;
+    }
+    if (web_server_screen_busy() || screen_rotation_busy()) {
+        httpd_resp_set_status(req, "409 Conflict");
+        return send_json(req, "{\"ok\":false,\"error\":\"screen busy\"}");
+    }
+    if (tf_card_ensure_mounted() != ESP_OK) {
+        return send_json(req, "{\"ok\":false,\"error\":\"no card\"}");
+    }
+
+    char path[sizeof(TF_CARD_EINK_DIR) + TF_NAME_MAX + 2];
+    struct stat st;
+    if (!tf_path(path, sizeof(path), name) || stat(path, &st) != 0 ||
+        !S_ISREG(st.st_mode) || st.st_size != SCREEN_FRAME_BYTES) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "not a 172800-byte frame");
+        return ESP_FAIL;
+    }
+    if (!begin_job(JOB_TF_IMPORT)) {
+        httpd_resp_set_status(req, "409 Conflict");
+        return send_json(req, "{\"ok\":false,\"error\":\"screen busy\"}");
+    }
+    memcpy(s_tf_pending.name, name, strlen(name) + 1);
+    s_tf_pending.slot = target;
+    xTaskNotifyGive(s_job_task);
+    httpd_resp_set_status(req, "202 Accepted");
+    return send_job_json(req);
+}
+
+static esp_err_t tf_export_post_handler(httpd_req_t *req)
+{
+    power_mgr_note_activity();
+    char body[192];
+    if (read_json_body(req, body, sizeof(body)) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "body size");
+        return ESP_FAIL;
+    }
+    cJSON *root = cJSON_ParseWithOpts(body, NULL, true);
+    const cJSON *slot = cJSON_GetObjectItemCaseSensitive(root, "slot");
+    const cJSON *namej = cJSON_GetObjectItemCaseSensitive(root, "name");
+    const bool valid = cJSON_IsObject(root) && cJSON_IsNumber(slot) &&
+        slot->valueint >= 0 && slot->valueint < SLOT_COUNT &&
+        (double)slot->valueint == slot->valuedouble &&
+        cJSON_IsString(namej) && tf_export_name_ok(namej->valuestring);
+    char name[TF_NAME_MAX + 1];
+    int target = 0;
+    if (valid) {
+        memcpy(name, namej->valuestring, strlen(namej->valuestring) + 1);
+        target = slot->valueint;
+    }
+    cJSON_Delete(root);
+    if (!valid) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "slot 0..2 and safe name required");
+        return ESP_FAIL;
+    }
+    if (web_server_screen_busy() || screen_rotation_busy()) {
+        httpd_resp_set_status(req, "409 Conflict");
+        return send_json(req, "{\"ok\":false,\"error\":\"screen busy\"}");
+    }
+    if (tf_card_ensure_mounted() != ESP_OK) {
+        return send_json(req, "{\"ok\":false,\"error\":\"no card\"}");
+    }
+    screen_rotation_lock();
+    const bool have = screen_rotation_slot_info(target, NULL);
+    screen_rotation_unlock();
+    if (!have) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "slot empty");
+        return ESP_FAIL;
+    }
+    if (!begin_job(JOB_TF_EXPORT)) {
+        httpd_resp_set_status(req, "409 Conflict");
+        return send_json(req, "{\"ok\":false,\"error\":\"screen busy\"}");
+    }
+    memcpy(s_tf_pending.name, name, strlen(name) + 1);
+    s_tf_pending.slot = target;
+    xTaskNotifyGive(s_job_task);
+    httpd_resp_set_status(req, "202 Accepted");
+    return send_job_json(req);
+}
+
+/* Both runners are called by the job task with the rotation lock held, so a
+ * 23 s refresh and a flash/FAT read never interleave. */
+static esp_err_t tf_job_import(const tf_pending_t *p)
+{
+    if (!tf_card_is_mounted()) return ESP_ERR_INVALID_STATE;
+    char path[sizeof(TF_CARD_EINK_DIR) + TF_NAME_MAX + 2];
+    if (!tf_path(path, sizeof(path), p->name)) return ESP_ERR_INVALID_ARG;
+    FILE *f = fopen(path, "rb");
+    if (f == NULL) return ESP_ERR_NOT_FOUND;
+
+    const uint8_t blank[3] = { SCREEN_COLOR_WHITE, SCREEN_COLOR_WHITE, SCREEN_COLOR_WHITE };
+    esp_err_t err = screen_rotation_capture_begin(SCREEN_CACHE_OTP6, blank, p->slot);
+    if (err != ESP_OK) {
+        fclose(f);
+        return err;
+    }
+
+    size_t total = 0;
+    while (total < SCREEN_FRAME_BYTES) {
+        size_t want = SCREEN_FRAME_BYTES - total;
+        if (want > sizeof(s_tf_chunk)) want = sizeof(s_tf_chunk);
+        const size_t got = fread(s_tf_chunk, 1, want, f);
+        if (got == 0) {
+            err = ESP_ERR_INVALID_SIZE;
+            break;
+        }
+        bool inks_ok = true;
+        for (size_t i = 0; i < got; ++i) {
+            const uint8_t hi = s_tf_chunk[i] >> 4, lo = s_tf_chunk[i] & 15;
+            if (!((hi <= 3 || hi == 5 || hi == 6) && (lo <= 3 || lo == 5 || lo == 6))) {
+                inks_ok = false;
+                break;
+            }
+        }
+        if (!inks_ok) {
+            err = ESP_ERR_INVALID_ARG;
+            break;
+        }
+        err = screen_rotation_capture_write(total, s_tf_chunk, got);
+        if (err != ESP_OK) break;
+        total += got;
+        set_job_progress(total, "import");
+    }
+    fclose(f);
+    if (err != ESP_OK || total != SCREEN_FRAME_BYTES) {
+        screen_rotation_capture_end(false, 0);
+        return err != ESP_OK ? err : ESP_ERR_INVALID_SIZE;
+    }
+
+    /* The slot header is written first. capture_end marks the slot current even
+     * though nothing was drawn yet, so drop the on-glass bookkeeping before the
+     * replay; otherwise show_image() would think the frame is already there. */
+    screen_rotation_capture_end(true, screen_driver_generation());
+    screen_rotation_note_external();
+    set_job_phase(JOB_REFRESH, "refresh");
+    ESP_LOGI(TAG, "tf import %s -> slot %d", p->name, p->slot);
+    return screen_rotation_show_image();
+}
+
+static esp_err_t tf_job_export(const tf_pending_t *p)
+{
+    if (!tf_card_is_mounted()) return ESP_ERR_INVALID_STATE;
+    if (!screen_rotation_slot_info(p->slot, NULL)) return ESP_ERR_INVALID_STATE;
+    (void)mkdir(TF_CARD_EINK_DIR, 0777);
+    char path[sizeof(TF_CARD_EINK_DIR) + TF_NAME_MAX + 2];
+    if (!tf_path(path, sizeof(path), p->name)) return ESP_ERR_INVALID_ARG;
+    FILE *f = fopen(path, "wb");
+    if (f == NULL) return ESP_FAIL;
+
+    esp_err_t err = ESP_OK;
+    size_t total = 0;
+    while (total < SCREEN_FRAME_BYTES) {
+        size_t want = SCREEN_FRAME_BYTES - total;
+        if (want > sizeof(s_tf_chunk)) want = sizeof(s_tf_chunk);
+        err = screen_rotation_read_frame(p->slot, total, s_tf_chunk, want);
+        if (err != ESP_OK) break;
+        if (fwrite(s_tf_chunk, 1, want, f) != want) {
+            err = ESP_FAIL;
+            break;
+        }
+        total += want;
+        set_job_progress(total, "export");
+    }
+    fflush(f);
+    fsync(fileno(f));
+    if (fclose(f) != 0 && err == ESP_OK) err = ESP_FAIL;
+    if (err == ESP_OK && total != SCREEN_FRAME_BYTES) err = ESP_ERR_INVALID_SIZE;
+    ESP_LOGI(TAG, "tf export slot %d -> %s (%u bytes, %s)",
+             p->slot, p->name, (unsigned)total, esp_err_to_name(err));
+    return err;
+}
+
 static void frame_job_task(void *arg)
 {
     (void)arg;
     for (;;) {
         (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
         const job_kind_t kind = s_job_kind;
+        if (kind == JOB_TF_IMPORT || kind == JOB_TF_EXPORT) {
+            const tf_pending_t tf = s_tf_pending;
+            screen_upload_report_t tf_report = {0};
+            const TickType_t tf_started = xTaskGetTickCount();
+            screen_rotation_lock();
+            const esp_err_t tf_err = kind == JOB_TF_IMPORT ? tf_job_import(&tf) : tf_job_export(&tf);
+            screen_rotation_unlock();
+            tf_report.total_ms = (uint32_t)((xTaskGetTickCount() - tf_started) * portTICK_PERIOD_MS);
+            if (tf_err == ESP_OK) {
+                tf_report.completed = true;
+                tf_report.display_generation = screen_driver_generation();
+            }
+            finish_job(tf_err, &tf_report);
+            ESP_LOGI(TAG, "job %s %s", job_kind_name(kind), esp_err_to_name(tf_err));
+            continue;
+        }
         frame_rx_t rx = s_pending;
         screen_upload_report_t report = {0};
         esp_err_t err;
@@ -817,7 +1223,7 @@ esp_err_t web_server_start(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
-    config.max_uri_handlers = 17;
+    config.max_uri_handlers = 20;
     config.stack_size = 12288;
     config.max_open_sockets = 7;
     config.recv_wait_timeout = 5;
@@ -853,6 +1259,9 @@ esp_err_t web_server_start(void)
         { .uri = "/api/slots", .method = HTTP_GET, .handler = slots_get_handler },
         { .uri = "/api/slot", .method = HTTP_GET, .handler = slot_get_handler },
         { .uri = "/api/imu", .method = HTTP_GET, .handler = imu_get_handler },
+        { .uri = "/api/tf", .method = HTTP_GET, .handler = tf_get_handler },
+        { .uri = "/api/tf/import", .method = HTTP_POST, .handler = tf_import_post_handler },
+        { .uri = "/api/tf/export", .method = HTTP_POST, .handler = tf_export_post_handler },
     };
     if (s_thumb_mutex == NULL) s_thumb_mutex = xSemaphoreCreateMutex();
     for (size_t i = 0; i < sizeof(handlers) / sizeof(handlers[0]); i++) {

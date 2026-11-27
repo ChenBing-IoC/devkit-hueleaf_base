@@ -399,6 +399,11 @@
     .slot-card:hover { background: var(--tint); }
     .slot-card.active { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); background: var(--tint); }
     .slot-card:disabled { opacity: 0.5; cursor: not-allowed; }
+    .tf-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 7px 0; border-top: 1px solid var(--tint); }
+    .tf-name { flex: 1 1 8rem; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 0.8rem; }
+    .tf-size { color: var(--faint); font-size: 0.72rem; font-variant-numeric: tabular-nums; }
+    .tf-row select { max-width: 7rem; }
+    .tf-export { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0; }
 
     .swatches {
       display: grid;
@@ -791,6 +796,35 @@
         </button>
       </div>
       <p class="hint">{{ slotHint }}</p>
+    </div>
+
+    <!-- TF 卡内容库 -->
+    <div v-show="tab === 'image'" class="panel" :inert="busy">
+      <div class="field">TF 卡内容库</div>
+      <p class="hint" v-if="!tfChecked">正在读取 TF 卡…</p>
+      <template v-else-if="!tfPresent">
+        <p class="hint">未检测到 TF 卡。插入 FAT32 卡后点「刷新列表」。</p>
+      </template>
+      <template v-else>
+        <p class="hint" v-if="!tfFiles.length">卡内 /eink 目录没有文件。可把槽位导出到卡，或放入 172800 字节的裸六色帧。</p>
+        <div v-for="f in tfFiles" :key="'tf-' + f.name" class="tf-row">
+          <span class="tf-name" :title="f.name">{{ f.name }}</span>
+          <span class="tf-size">{{ formatSize(f.size) }}</span>
+          <select v-model.number="f.target" :disabled="busy || !f.valid" :aria-label="f.name + ' 目标槽位'">
+            <option :value="0">槽位 1</option>
+            <option :value="1">槽位 2</option>
+            <option :value="2">槽位 3</option>
+          </select>
+          <button class="ghost-btn" type="button" :disabled="busy || !f.valid" @click="importFromTf(f)">导入到槽位</button>
+        </div>
+        <p class="hint" v-if="tfFiles.some(f => !f.valid)">大小不是 172800 字节的文件标记为无效，不能导入。</p>
+        <div class="tf-export">
+          <button v-for="s in slots" :key="'tfe-' + s.i" class="ghost-btn" type="button"
+                  :disabled="busy || !s.valid" @click="exportToTf(s)">导出槽位 {{ s.i + 1 }} 到 TF 卡</button>
+        </div>
+      </template>
+      <button class="ghost-btn" type="button" :disabled="busy || tfBusy" @click="refreshTf">刷新列表</button>
+      <p class="status" :class="tfStatusClass" role="status" aria-live="polite">{{ tfStatus }}</p>
     </div>
 
     <!-- 图片 -->
@@ -1215,6 +1249,132 @@
             slotFetchInFlight = false;
           }
         };
+
+        /* TF content library: only the pre-dithered 172800-byte raw frames in
+         * /sdcard/eink are importable. Import/export run as device jobs, so the
+         * page polls /api/job exactly like a normal upload. */
+        const tfChecked = ref(false);
+        const tfPresent = ref(false);
+        const tfMounted = ref(false);
+        const tfFiles = ref([]);
+        const tfBusy = ref(false);
+        const tfStatus = ref('');
+        const tfStatusClass = ref('');
+        const nextSlotIndex = () => ((slotCurrent.value >= 0 ? slotCurrent.value : -1) + 1) % 3;
+        const formatSize = (n) => n === 172800 ? '172800 B'
+          : (n >= 1024 ? (n / 1024).toFixed(1) + ' KB' : n + ' B');
+        const refreshTf = async () => {
+          if (tfBusy.value) return;
+          tfBusy.value = true;
+          tfStatusClass.value = '';
+          try {
+            const res = await fetch('/api/tf', { cache: 'no-store' });
+            if (res.status === 409) {
+              tfStatus.value = '屏幕忙，稍后再试';
+              tfStatusClass.value = 'err';
+              return;
+            }
+            const info = await res.json();
+            tfChecked.value = true;
+            if (!info || info.ok === false) {
+              tfPresent.value = false; tfMounted.value = false; tfFiles.value = [];
+              tfStatus.value = (info && info.error) || 'TF 卡不可用';
+              tfStatusClass.value = 'err';
+              return;
+            }
+            tfPresent.value = !!info.present;
+            tfMounted.value = !!info.mounted;
+            const fallback = nextSlotIndex();
+            tfFiles.value = (info.files || []).map(f => ({
+              name: String(f.name || ''), size: Number(f.size) || 0,
+              valid: !!f.valid, target: fallback,
+            }));
+            tfStatus.value = tfPresent.value
+              ? (tfFiles.value.length ? '共 ' + tfFiles.value.length + ' 个文件' : '卡已挂载，/eink 为空')
+              : '未检测到 TF 卡';
+            tfStatusClass.value = tfPresent.value ? 'ok' : 'err';
+          } catch (_) {
+            tfChecked.value = true;
+            tfPresent.value = false; tfFiles.value = [];
+            tfStatus.value = '读取 TF 卡失败';
+            tfStatusClass.value = 'err';
+          } finally {
+            tfBusy.value = false;
+          }
+        };
+        const pollTfJob = async (id, timeoutMs) => {
+          const deadline = Date.now() + timeoutMs;
+          while (Date.now() < deadline) {
+            const job = await fetchJson('/api/job', { cache: 'no-store' }, 12000);
+            if (!job.ok || job.id !== id) throw new Error('任务已变化');
+            if (job.phase === 'error' || job.err) throw new Error('设备处理失败 err=' + (job.err ?? '?'));
+            if (job.phase === 'idle') return job;
+            await new Promise(r => setTimeout(r, 800));
+          }
+          throw new Error('等待设备超时');
+        };
+        const importFromTf = async (f) => {
+          if (busy.value || tfBusy.value || !f.valid) return;
+          busy.value = true;
+          tfBusy.value = true;
+          phase.value = 'refresh';
+          status.value = '正在从 TF 卡导入到槽位 ' + (f.target + 1) + '…';
+          try {
+            const res = await fetch('/api/tf/import', {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ file: f.name, slot: f.target }),
+            });
+            const info = await res.json().catch(() => null);
+            if (!info || info.ok === false) throw new Error((info && info.error) || ('HTTP ' + res.status));
+            if (!Number.isInteger(info.id)) throw new Error('设备协议不匹配');
+            const done = await pollTfJob(info.id, 180000);
+            if (done.kind !== 'tf-import' || done.err !== 0 || done.completed_mask !== 1)
+              throw new Error('导入完成凭据不匹配');
+            slotCurrent.value = f.target;
+            slotTouched.value = false;
+            lastPanelFrame.value = null;
+            regionUpdate.value = false;
+            phase.value = 'done';
+            status.value = '已从 TF 卡导入到槽位 ' + (f.target + 1);
+            await refreshSlots();
+          } catch (e) {
+            phase.value = 'error';
+            status.value = '导入失败：' + (e.message || e);
+          } finally {
+            busy.value = false;
+            tfBusy.value = false;
+            refreshTf();
+          }
+        };
+        const exportToTf = async (s) => {
+          if (busy.value || tfBusy.value || !s.valid) return;
+          busy.value = true;
+          tfBusy.value = true;
+          phase.value = 'refresh';
+          const name = 'slot' + (s.i + 1) + '-' + Date.now() + '.bin';
+          status.value = '正在导出槽位 ' + (s.i + 1) + ' 到 TF 卡…';
+          try {
+            const res = await fetch('/api/tf/export', {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ slot: s.i, name }),
+            });
+            const info = await res.json().catch(() => null);
+            if (!info || info.ok === false) throw new Error((info && info.error) || ('HTTP ' + res.status));
+            if (!Number.isInteger(info.id)) throw new Error('设备协议不匹配');
+            const done = await pollTfJob(info.id, 60000);
+            if (done.kind !== 'tf-export' || done.err !== 0 || done.completed_mask !== 1)
+              throw new Error('导出完成凭据不匹配');
+            phase.value = 'done';
+            status.value = '已导出到 ' + name;
+          } catch (e) {
+            phase.value = 'error';
+            status.value = '导出失败：' + (e.message || e);
+          } finally {
+            busy.value = false;
+            tfBusy.value = false;
+            refreshTf();
+          }
+        };
         const ditherQuality = ref('best');
         const ditherModes = [
           { id: 'fast', name: '轻度', note: '扩散较轻 · 颗粒更细' },
@@ -1573,6 +1733,7 @@
           previewBusy.value = false;
           tab.value = t;
           if (t === 'settings') refreshImu();
+          else if (t === 'image') refreshTf();
           nextTick(() => {
             if (t === 'text') renderText();
             else if (t === 'image' && imageEl.value) scheduleDither();
@@ -1946,6 +2107,8 @@
           clearDisplay,
           lastPanelFrame, regionUpdate, forceRefresh, updateRect, canRegionUpdate, setRegionUpdate,
           slots, slotCurrent, slotTarget, slotHint, selectSlot, bindSlotCanvas,
+          tfChecked, tfPresent, tfMounted, tfFiles, tfBusy, tfStatus, tfStatusClass,
+          refreshTf, importFromTf, exportToTf, formatSize,
           onCropChange, onAdjustChange, resetCrop, resetAdjust, rotateImage, imageRotation,
           onPanStart, onPanMove, onPanEnd, scanWifi, selectWifi, connectWifi, setChargePower,
           themes, theme, themeName, setTheme,

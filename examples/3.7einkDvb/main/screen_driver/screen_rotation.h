@@ -46,6 +46,9 @@ int screen_rotation_current(void);
 bool screen_rotation_slot_info(int index, unsigned *rotation);
 /* RGB(A) thumbnail of a stored slot for the web page. */
 esp_err_t screen_rotation_preview(int index, uint8_t *rgba, int width, int height);
+/* Copy the raw 172800-byte six-ink frame of a stored slot for export.
+ * Caller holds the rotation lock. Empty or multi-plane slots are rejected. */
+esp_err_t screen_rotation_read_frame(int index, size_t offset, uint8_t *buffer, size_t length);
 
 /* Bottom text strip used to mark the awake state (the device IP). An empty or
  * NULL string disables it; it is never stored with the picture. */
