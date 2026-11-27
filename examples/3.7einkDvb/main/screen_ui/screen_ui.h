@@ -6,8 +6,9 @@
 #include "esp_err.h"
 
 esp_err_t screen_ui_show_link_qr(const char *title, const char *url);
-/* Offline provisioning page: text and address, without QR generation. */
-esp_err_t screen_ui_show_setup(const char *url);
+/* Offline provisioning page: SSID, AP password and address, no QR code. The
+ * password is shown because the SoftAP is WPA2 by default. */
+esp_err_t screen_ui_show_setup(const char *url, const char *ssid, const char *pass);
 /* Centered message page (title + up to three lines, ASCII 5x7 font).
  * Used for the low power notice; empty lines are skipped. */
 esp_err_t screen_ui_show_message(const char *title, const char *line1,

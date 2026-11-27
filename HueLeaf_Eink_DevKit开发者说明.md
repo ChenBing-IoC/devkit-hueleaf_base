@@ -133,6 +133,7 @@ SPI 主机为 SPI2。板级代码将共享总线访问串行化；自行添加 S
 - 充电时（`axp2101_is_usb_connected()` 为真）「自动」策略只降功耗到浅睡、不深睡也不自动关机，避免 USB 调试和充电过程中意外断电；「强制深睡」则无视 USB。
 - 自动关机规则随定时唤醒变化：`interval_min > 0` 时不再执行 30 分钟关机（否则定时唤醒会被关掉），只保留电量保护；把唤醒间隔设为 0 才恢复 `POWER_AUTO_OFF_MS` 规则。
 - 睡眠策略与唤醒间隔保存在 NVS 命名空间 `pwrmgr`（`interval_min`、`mode`），网页「设置」页或 `GET/POST /api/power` 读写，下一次进入低功耗时生效。
+- 网络身份与安全配置保存在 NVS 命名空间 `netcfg`：`ap_pass` 是 SoftAP 的 WPA2 密码，默认 `hueleaf-` + STA MAC 后 4 位小写十六进制（12 字符），首次启动生成并保存；`token` 是可选 API token，空字符串表示不启用。两者都是明文，写入前校验为可打印 ASCII（禁止引号和反斜杠，密码 8–63、token 8–64），日志只打印 `***`。所有 `POST /api/*` 在 `web_server.c` 的注册循环里统一套用 `auth_post_dispatch`：接受 `X-Auth-Token` 头或 `?token=` 查询参数，缺失/错误返回 `401` 和 `{"ok":false,"error":"unauthorized"}`；`GET` 不校验，保证页面加载与状态轮询不会被锁死。上电早期按住 BOOT（GPIO28）5 秒会清除 `netcfg/ap_pass`、`netcfg/token` 以及 `wifi_cfg/ssid`、`wifi_cfg/pass`，恢复默认热点密码，并在串口和屏幕提示。
 - 若产品需要更激进的续航，可进一步关闭面板电源轨或调用 `screen_driver_deep_sleep()`；注意后者会让面板进入深睡，唤醒后需要重新初始化面板才能刷新。
 
 ## 5. 开发环境与构建
@@ -162,7 +163,8 @@ idf.py -p COMx flash monitor
 | 电子紙驱动 | `main/screen_driver/` | 初始化 EPD037A02，写入六色帧，流式接收并刷新，支持休眠 |
 | 信息页 / 农历 | `main/content/` | 1900–2100 农历压缩表、Meeus 节气、列式 5×7 信息页；NVS 命名空间 `content` 保存便签 / 倒计时 / 启用开关与绘制指纹；不占用图片槽位，按需初始化面板 |
 | 天气 | `main/content/weather.c` | Open-Meteo 免 key 天气与 4 天预报；NVS 命名空间 `weather` 保存经纬度 / 城市标签 / 启用开关和最近一次成功缓存；维护唤醒在 SNTP 后抓取（8 秒超时，失败保留旧值），交互会话仅手动刷新 |
-| Wi-Fi 配网 | `main/wifi_mgr/` | SoftAP 初始开放网络名为 `Eink E6 3.7`，访问 `http://192.168.4.1`；配置 STA 后切换到局域网地址；提供 `wifi_mgr_suspend()` / `wifi_mgr_resume()` 供低功耗使用，`wifi_mgr_sta_start()` 供定时维护唤醒只连 STA |
+| Wi-Fi 配网 | `main/wifi_mgr/` | SoftAP 默认 WPA2，名为 `Eink E6 3.7`，访问 `http://192.168.4.1`；配置 STA 后切换到局域网地址；提供 `wifi_mgr_suspend()` / `wifi_mgr_resume()` 供低功耗使用，`wifi_mgr_sta_start()` 供定时维护唤醒只连 STA |
+| mDNS / 安全配置 | `main/wifi_mgr/mdns_adv.c`、`main/wifi_mgr/netcfg.c` | 内置极简 mDNS 应答器（`hueleaf-xxxx.local`、尽力注册别名 `hueleaf.local`、`_http._tcp` 端口 80 / TXT `path=/`），随 Wi-Fi 启停且维护唤醒不启动。ESP-IDF v5.x 已把 mdns 移出主仓库改为组件仓库依赖，本工程不引入该组件，应答器直接基于 lwIP UDP 5353 实现；`netcfg` 管理 WPA2 密码与可选 token，`POST /api/*` 统一鉴权；BOOT 上电长按 5 秒恢复出厂网络设置 |
 | 低功耗管理 | `main/power_mgr/` | 2 分钟无网络活动关闭 AP：电池供电深睡 + 定时唤醒（维护会话校时，并按信息页指纹决定是否刷新），插 USB 保持浅睡；电源键唤醒重开 AP；定时唤醒关闭时保留 30 分钟关机，另有 5% 电量保护 |
 | Web 屏幕服务 | `main/web_server/` | 浏览器端图像上传和设备状态接口 |
 | TF 卡 | `main/tf_card/` | 与屏幕共用 SPI2；以 FAT 文件系统按需挂载到 `/sdcard`，进入低功耗前卸载，不自动格式化卡；内容库目录 `/sdcard/eink`，维护日志 `/sdcard/log/power.csv` |
@@ -170,7 +172,7 @@ idf.py -p COMx flash monitor
 | RTC | `main/rtc/pcf8563.c` | 掉电保时；开机读取 RTC 灌入系统时钟（只向前调），SNTP 校时成功后写回；仅在 VL 置位或读数不合理时才用编译时间初始化 |
 | IMU | `main/imu/msa321.c`、`main/imu/imu_app.c` | `msa321.c` 以 ±4 g、125 Hz 配置并提供 any-motion 中断接口（寄存器表待手册核对）；`imu_app.c` 醒着时约 15 Hz 采样，识别翻面/双击换图，经 `/api/imu` 暴露状态，并向 `power_mgr` 提供深睡运动唤醒的 arm/clear |
 
-SoftAP 当前配置为开放网络，仅建议在受控开发环境中使用。开发网页服务时注意该 AP 没有密码保护。
+SoftAP 默认启用 WPA2，`pmf_cfg.required = false` 以兼容旧手机；密码规则、修改方式与 BOOT 恢复流程见上文「网络身份与安全配置」。修改密码后 `wifi_mgr_apply_ap_config()` 让驱动立即用新配置重启热点，主任务收到 `web_server_set_net_changed_cb()` 的回调后强制重绘配网页（SSID / PASS）。OTA 空间与升级路线见 [docs/ota.md](docs/ota.md)。
 
 ## 7. 开发注意事项
 

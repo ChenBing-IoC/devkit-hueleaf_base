@@ -16,6 +16,8 @@ idf_component_register(
         "qrcode/qrcode.c"
         "tf_card/tf_card.c"
         "wifi_mgr/wifi_mgr.c"
+        "wifi_mgr/netcfg.c"
+        "wifi_mgr/mdns_adv.c"
         "power_mgr/power_mgr.c"
         "web_server/web_server.c"
     INCLUDE_DIRS

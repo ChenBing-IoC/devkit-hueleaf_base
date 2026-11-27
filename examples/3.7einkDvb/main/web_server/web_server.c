@@ -8,6 +8,7 @@
 
 #include <stdio.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <dirent.h>
@@ -24,6 +25,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "imu_app.h"
+#include "netcfg.h"
 #include "screen_driver.h"
 #include "screen_ui.h"
 #include "tf_card.h"
@@ -92,6 +94,7 @@ static void log_heap_stats(const char *event, uint32_t id)
 
 
 static esp_err_t send_json(httpd_req_t *req, const char *json);
+static esp_err_t read_json_body(httpd_req_t *req, char *body, size_t capacity);
 static void frame_job_task(void *arg);
 static const char *job_kind_name(job_kind_t kind)
 {
@@ -239,6 +242,68 @@ static esp_err_t send_json(httpd_req_t *req, const char *json)
     return err;
 }
 
+/* ---- Optional API token --------------------------------------------------- */
+
+static web_server_net_cb_t s_net_cb;
+
+void web_server_set_net_changed_cb(web_server_net_cb_t cb)
+{
+    s_net_cb = cb;
+}
+
+/* Empty token keeps the historical behaviour: every request is accepted.
+ * Header form wins over the query form so a token in the URL never hides a
+ * mismatching header. */
+static bool request_token_ok(httpd_req_t *req)
+{
+    char want[65];
+    (void)netcfg_get_api_token(want, sizeof(want));
+    if (want[0] == 0) {
+        return true;
+    }
+
+    char given[65];
+    if (httpd_req_get_hdr_value_str(req, "X-Auth-Token", given, sizeof(given)) == ESP_OK &&
+        strcmp(given, want) == 0) {
+        return true;
+    }
+
+    char query[128];
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        char value[65];
+        if (httpd_query_key_value(query, "token", value, sizeof(value)) == ESP_OK &&
+            strcmp(value, want) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Registered instead of the real handler for every POST under /api: the
+ * original handler index travels in user_ctx, so a new POST endpoint cannot
+ * forget the check. GET stays open by design (page load and status polling). */
+typedef esp_err_t (*web_route_fn_t)(httpd_req_t *);
+#define WEB_POST_ROUTES 32
+static web_route_fn_t s_post_routes[WEB_POST_ROUTES];
+static size_t s_post_route_count;
+
+static esp_err_t auth_post_dispatch(httpd_req_t *req)
+{
+    if (!request_token_ok(req)) {
+        httpd_resp_set_status(req, "401 Unauthorized");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+        (void)httpd_resp_send(req, "{\"ok\":false,\"error\":\"unauthorized\"}",
+                              HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+    const size_t index = (size_t)req->user_ctx;   /* 1-based */
+    if (index == 0 || index > s_post_route_count) {
+        return ESP_FAIL;
+    }
+    return s_post_routes[index - 1](req);
+}
+
 static esp_err_t root_get_handler(httpd_req_t *req)
 {
     power_mgr_note_activity();
@@ -304,17 +369,26 @@ static esp_err_t status_get_handler(httpd_req_t *req)
 {
     char ip[16] = { 0 };
     char ssid[33] = { 0 };
+    char host[40] = { 0 };
+    char ap_pass[64] = { 0 };
     char escaped_ssid[193];
+    char escaped_pass[193];
     char url[48] = { 0 };
-    char json[1024];
+    char json[1152];
     wifi_mgr_get_ip(ip, sizeof(ip));
     wifi_mgr_get_ssid(ssid, sizeof(ssid));
     wifi_mgr_service_url(url, sizeof(url));
+    wifi_mgr_get_hostname(host, sizeof(host));
+    (void)netcfg_get_ap_password(ap_pass, sizeof(ap_pass));
     escape_ssid(ssid, escaped_ssid);
+    escape_ssid(ap_pass, escaped_pass);
     int n = snprintf(json, sizeof(json),
         "{\"ok\":true,\"format\":\"otp6-v1\",\"w\":480,\"h\":720,\"frame\":172800,"
-        "\"mode\":\"%s\",\"ip\":\"%s\",\"ssid\":\"%s\",\"url\":\"%s\"",
-        wifi_mgr_is_sta_up() ? "sta" : "ap", ip, escaped_ssid, url);
+        "\"mode\":\"%s\",\"ip\":\"%s\",\"ssid\":\"%s\",\"url\":\"%s\","
+        "\"host\":\"%s\",\"ap_ssid\":\"" WIFI_AP_SSID "\",\"ap_pass\":\"%s\","
+        "\"token_set\":%s",
+        wifi_mgr_is_sta_up() ? "sta" : "ap", ip, escaped_ssid, url,
+        host, escaped_pass, netcfg_token_set() ? "true" : "false");
     if (n < 0 || (size_t)n >= sizeof(json)) return ESP_FAIL;
     size_t used = append_charge_json(json, sizeof(json), (size_t)n);
     if (used + 160 >= sizeof(json)) return ESP_FAIL;
@@ -502,6 +576,77 @@ static esp_err_t wifi_scan_handler(httpd_req_t *req)
     static char json[2048];
     (void)wifi_mgr_scan_json(json, sizeof(json));
     return send_json(req, json);
+}
+
+/* SoftAP credential change: store it, restart the AP, and let the UI task put
+ * the new SSID/password on the glass (the HTTP reply usually dies with the
+ * client's association, which is why the page warns before sending). */
+static esp_err_t ap_post_handler(httpd_req_t *req)
+{
+    char body[192];
+    if (read_json_body(req, body, sizeof(body)) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "body size");
+        return ESP_FAIL;
+    }
+
+    cJSON *root = cJSON_ParseWithOpts(body, NULL, true);
+    const cJSON *pw = cJSON_GetObjectItemCaseSensitive(root, "password");
+    const bool valid = cJSON_IsObject(root) && cJSON_IsString(pw) &&
+                       netcfg_text_ok(pw->valuestring, 8, 63);
+    char pass[64] = { 0 };
+    if (valid) {
+        snprintf(pass, sizeof(pass), "%s", pw->valuestring);
+    }
+    cJSON_Delete(root);
+    if (!valid) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                            "password 8..63 printable ascii");
+        return ESP_FAIL;
+    }
+
+    esp_err_t err = netcfg_set_ap_password(pass);
+    if (err == ESP_OK) err = wifi_mgr_apply_ap_config();
+    if (err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, esp_err_to_name(err));
+        return ESP_FAIL;
+    }
+    ESP_LOGI(TAG, "AP password changed, SoftAP restarted (***)");
+    if (s_net_cb) s_net_cb();
+    return send_json(req, "{\"ok\":true,\"msg\":\"ap restarted, reconnect\"}");
+}
+
+/* Empty string clears the token and restores the open API. */
+static esp_err_t token_post_handler(httpd_req_t *req)
+{
+    char body[192];
+    if (read_json_body(req, body, sizeof(body)) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "body size");
+        return ESP_FAIL;
+    }
+
+    cJSON *root = cJSON_ParseWithOpts(body, NULL, true);
+    const cJSON *tok = cJSON_GetObjectItemCaseSensitive(root, "token");
+    const char *value = cJSON_IsString(tok) ? tok->valuestring : NULL;
+    const bool valid = cJSON_IsObject(root) && cJSON_IsString(tok) &&
+                       (value[0] == 0 || netcfg_text_ok(value, 8, 64));
+    char token[65] = { 0 };
+    if (valid) {
+        snprintf(token, sizeof(token), "%s", value);
+    }
+    cJSON_Delete(root);
+    if (!valid) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                            "token 8..64 printable ascii or empty");
+        return ESP_FAIL;
+    }
+
+    const esp_err_t err = netcfg_set_api_token(token);
+    if (err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, esp_err_to_name(err));
+        return ESP_FAIL;
+    }
+    return send_json(req, token[0] ? "{\"ok\":true,\"token_set\":true}"
+                                   : "{\"ok\":true,\"token_set\":false}");
 }
 
 static esp_err_t wifi_connect_handler(httpd_req_t *req)
@@ -1763,6 +1908,8 @@ esp_err_t web_server_start(void)
         { .uri = "/api/status", .method = HTTP_GET, .handler = status_get_handler },
         { .uri = "/api/wifi/scan", .method = HTTP_GET, .handler = wifi_scan_handler },
         { .uri = "/api/wifi/connect", .method = HTTP_POST, .handler = wifi_connect_handler },
+        { .uri = "/api/ap", .method = HTTP_POST, .handler = ap_post_handler },
+        { .uri = "/api/token", .method = HTTP_POST, .handler = token_post_handler },
         { .uri = "/api/charge", .method = HTTP_GET, .handler = charge_get_handler },
         { .uri = "/api/charge", .method = HTTP_POST, .handler = charge_post_handler },
         { .uri = "/api/power", .method = HTTP_GET, .handler = power_get_handler },
@@ -1787,8 +1934,18 @@ esp_err_t web_server_start(void)
         { .uri = "/api/tf/export", .method = HTTP_POST, .handler = tf_export_post_handler },
     };
     if (s_thumb_mutex == NULL) s_thumb_mutex = xSemaphoreCreateMutex();
+    s_post_route_count = 0;
     for (size_t i = 0; i < sizeof(handlers) / sizeof(handlers[0]); i++) {
-        ESP_RETURN_ON_ERROR(httpd_register_uri_handler(server, &handlers[i]), TAG, "register URI");
+        httpd_uri_t item = handlers[i];
+        if (item.method == HTTP_POST) {
+            /* Token check for every POST; GET is intentionally left open. */
+            if (s_post_route_count >= WEB_POST_ROUTES) return ESP_ERR_NO_MEM;
+            s_post_routes[s_post_route_count] = item.handler;
+            item.user_ctx = (void *)(uintptr_t)(s_post_route_count + 1);
+            item.handler = auth_post_dispatch;
+            s_post_route_count++;
+        }
+        ESP_RETURN_ON_ERROR(httpd_register_uri_handler(server, &item), TAG, "register URI");
     }
 
     ESP_LOGI(TAG, "HTTP ready on :80");

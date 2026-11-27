@@ -11,6 +11,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/semphr.h"
+#include "mdns_adv.h"
+#include "netcfg.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 
@@ -37,6 +39,9 @@ static char s_sta_ip[16];
 static char s_ssid[33];
 static char s_pass[65];
 static int s_retry;
+static esp_netif_t *s_mdns_netif;
+/* A maintenance wake connects STA only: no SoftAP, no mDNS. */
+static volatile bool s_maintenance;
 
 static void lock(void)
 {
@@ -128,16 +133,29 @@ static void apply_radio(void)
     (void)esp_wifi_set_max_tx_power(80);
 }
 
+/* WPA2 by default; pmf_cfg.required stays false so older phones can join.
+ * The channel and country code policy is unchanged (5 GHz, channel 36, CN). */
 static esp_err_t config_ap(void)
 {
     wifi_config_t ap = { 0 };
+    char pass[64 + 1] = { 0 };
+    (void)netcfg_get_ap_password(pass, sizeof(pass));
+
     strncpy((char *)ap.ap.ssid, WIFI_AP_SSID, sizeof(ap.ap.ssid) - 1);
     ap.ap.ssid_len = strlen(WIFI_AP_SSID);
     ap.ap.channel = WIFI_AP_CHANNEL;
     ap.ap.max_connection = 4;
-    ap.ap.authmode = WIFI_AUTH_OPEN;
     ap.ap.beacon_interval = 100;
     ap.ap.pmf_cfg.required = false;
+    if (netcfg_text_ok(pass, 8, 63)) {
+        strncpy((char *)ap.ap.password, pass, sizeof(ap.ap.password) - 1);
+        ap.ap.authmode = WIFI_AUTH_WPA2_PSK;
+    } else {
+        /* Only reachable with a corrupted NVS value; the device must still
+         * come up so the user can recover it from the web page. */
+        ap.ap.authmode = WIFI_AUTH_OPEN;
+        ESP_LOGW(TAG, "AP password invalid, starting open");
+    }
     return esp_wifi_set_config(WIFI_IF_AP, &ap);
 }
 
@@ -166,8 +184,39 @@ static esp_err_t start_apsta(void)
     (void)config_ap();
     s_ap_up = true;
     s_ap_clients = 0;
-    ESP_LOGI(TAG, "provision AP \"%s\"  open  %s", WIFI_AP_SSID, WIFI_AP_URL);
+    ESP_LOGI(TAG, "provision AP \"%s\"  WPA2  %s", WIFI_AP_SSID, WIFI_AP_URL);
     return ESP_OK;
+}
+
+/* mDNS follows the Wi-Fi lifecycle: restart only when the active interface
+ * changes, so a brief STA reconnect does not re-probe the alias. */
+static void start_mdns(void)
+{
+    esp_netif_t *netif = NULL;
+    if (s_sta_up) {
+        netif = s_sta_netif;
+    } else if (s_ap_up) {
+        netif = s_ap_netif;
+    }
+    if (netif == NULL || s_maintenance) {
+        mdns_adv_stop();
+        s_mdns_netif = NULL;
+        return;
+    }
+    if (netif == s_mdns_netif && mdns_adv_running()) {
+        return;
+    }
+    const esp_err_t err = mdns_adv_start(netif);
+    s_mdns_netif = err == ESP_OK ? netif : NULL;
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "mDNS start: %s", esp_err_to_name(err));
+    }
+}
+
+static void stop_mdns(void)
+{
+    mdns_adv_stop();
+    s_mdns_netif = NULL;
 }
 
 static void stop_ap_keep_sta(void)
@@ -198,6 +247,8 @@ static void on_got_ip(const char *ip)
     if (s_ready_cb) {
         s_ready_cb();
     }
+    /* The SoftAP just closed: re-home the responder on the STA interface. */
+    start_mdns();
 }
 
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
@@ -313,7 +364,11 @@ static esp_err_t init_common(void)
 esp_err_t wifi_mgr_start(void)
 {
     ESP_RETURN_ON_ERROR(init_common(), TAG, "wifi init");
-    return begin_network(BOOT_WAIT_MS);
+    const esp_err_t err = begin_network(BOOT_WAIT_MS);
+    if (err == ESP_OK) {
+        start_mdns();
+    }
+    return err;
 }
 
 esp_err_t wifi_mgr_sta_start(uint32_t timeout_ms)
@@ -325,15 +380,26 @@ esp_err_t wifi_mgr_sta_start(uint32_t timeout_ms)
     ESP_LOGI(TAG, "maintenance STA \"%s\", %u ms cap", s_ssid, (unsigned)timeout_ms);
     xEventGroupClearBits(s_events, GOT_IP_BIT | STA_FAIL_BIT);
     s_retry = 0;
+    s_maintenance = true;
     esp_err_t err = esp_wifi_set_mode(WIFI_MODE_STA);
-    if (err != ESP_OK) return err;
+    if (err != ESP_OK) {
+        s_maintenance = false;
+        return err;
+    }
     err = config_sta(s_ssid, s_pass);
-    if (err != ESP_OK) return err;
+    if (err != ESP_OK) {
+        s_maintenance = false;
+        return err;
+    }
     err = esp_wifi_start();
-    if (err != ESP_OK && err != ESP_ERR_WIFI_CONN) return err;
+    if (err != ESP_OK && err != ESP_ERR_WIFI_CONN) {
+        s_maintenance = false;
+        return err;
+    }
     apply_radio();
     EventBits_t bits = xEventGroupWaitBits(s_events, GOT_IP_BIT | STA_FAIL_BIT,
                                            pdFALSE, pdFALSE, pdMS_TO_TICKS(timeout_ms));
+    s_maintenance = false;
     if (bits & GOT_IP_BIT) {
         return ESP_OK;
     }
@@ -347,6 +413,7 @@ esp_err_t wifi_mgr_sta_start(uint32_t timeout_ms)
 
 esp_err_t wifi_mgr_suspend(void)
 {
+    stop_mdns();
     lock();
     s_suspended = true;
     s_ap_up = false;
@@ -381,7 +448,36 @@ esp_err_t wifi_mgr_resume(void)
         return ESP_OK;
     }
     ESP_LOGI(TAG, "resume network after low power");
-    return begin_network(BOOT_WAIT_MS);
+    const esp_err_t err = begin_network(BOOT_WAIT_MS);
+    if (err == ESP_OK) {
+        start_mdns();
+    }
+    return err;
+}
+
+/* Re-apply the SoftAP config (new password) while the interface is running.
+ * Stations are dropped by the driver; the caller tells the user to reconnect. */
+esp_err_t wifi_mgr_apply_ap_config(void)
+{
+    if (!s_ap_up) {
+        return ESP_OK;   /* the next start_apsta() picks the stored password */
+    }
+    lock();
+    s_ap_clients = 0;
+    unlock();
+    const esp_err_t err = config_ap();
+    if (err == ESP_OK) {
+        /* The driver applies a running AP's new SSID/key and drops the current
+         * stations; if it ever refuses, the next start_apsta() still picks the
+         * stored password up. */
+        ESP_LOGI(TAG, "SoftAP config updated (***)");
+    }
+    return err;
+}
+
+esp_err_t wifi_mgr_get_hostname(char *buf, size_t len)
+{
+    return netcfg_hostname(buf, len);
 }
 
 wifi_mgr_mode_t wifi_mgr_mode(void)

@@ -36,6 +36,12 @@ esp_err_t wifi_mgr_service_url(char *buf, size_t len);
 esp_err_t wifi_mgr_scan_json(char *buf, size_t len);
 esp_err_t wifi_mgr_connect(const char *ssid, const char *password);
 esp_err_t wifi_mgr_clear_creds(void);
+/* Re-apply the stored SoftAP password; no-op when the AP is closed (the next
+ * start uses the new value). Drops connected clients on purpose. */
+esp_err_t wifi_mgr_apply_ap_config(void);
+/* "hueleaf-xxxx.local"; empty credentials are impossible, the value is derived
+ * from the STA MAC on first boot. */
+esp_err_t wifi_mgr_get_hostname(char *buf, size_t len);
 void wifi_mgr_set_ready_cb(wifi_mgr_ready_cb_t cb);
 
 #endif /* WIFI_MGR_H */

@@ -107,8 +107,11 @@ typedef struct {
     bool with_status;
     bool lunar_valid;
     bool lunar_leap;
+    bool low;          /* soc < 15 %: highlight the status strip */
+    bool charge_me;    /* soc < 8 %: extra red line */
     int lunar_year, lunar_month, lunar_day;
     int days;
+    int soc;           /* -1 when the gauge cannot be read */
 } content_snapshot_t;
 
 static content_snapshot_t s_snap;
@@ -128,6 +131,7 @@ typedef struct {
     int label_x, label_y, label_w;
     int note_x, note0_y, note1_y, note_w[CONTENT_NOTE_LINES];
     int status_x, status_y, status_w;
+    int charge_x, charge_y, charge_w;
     int box_x0, box_y0, box_x1, box_y1;
 } page_layout_t;
 
@@ -314,6 +318,13 @@ static void snapshot_build(const content_config_t *cfg, bool with_status,
 {
     memset(snap, 0, sizeof(*snap));
     snap->with_status = with_status;
+    /* Battery is part of the fingerprint only as a coarse bucket, so a 10 %
+     * step (and the two warning thresholds) triggers one redraw on the next
+     * maintenance wake instead of a refresh every minute. */
+    const int soc = axp2101_battery_percent();
+    snap->soc = soc >= 0 ? soc : -1;
+    snap->low = snap->soc >= 0 && snap->soc < 15;
+    snap->charge_me = snap->soc >= 0 && snap->soc < 8;
     snap->has_label = cfg->countdown_label[0] != '\0';
     copy_text(snap->label, sizeof(snap->label), cfg->countdown_label);
     for (int i = 0; i < CONTENT_NOTE_LINES; ++i) {
@@ -404,8 +415,13 @@ static uint32_t hash_int(uint32_t hash, int value)
 static uint32_t snapshot_hash(const content_snapshot_t *snap)
 {
     uint32_t hash = 2166136261U;
-    hash = hash_str(hash, "content-v2");
+    hash = hash_str(hash, "content-v3");
     hash = hash_int(hash, snap->with_status ? 1 : 0);
+    /* Coarse battery state only: one redraw per 10 % step, plus the exact
+     * crossings of the 15 % (LOW) and 8 % (CHARGE ME) thresholds. */
+    hash = hash_int(hash, snap->soc >= 0 ? snap->soc / 10 : -1);
+    hash = hash_int(hash, snap->low ? 1 : 0);
+    hash = hash_int(hash, snap->charge_me ? 1 : 0);
     hash = hash_str(hash, snap->iso);
     hash = hash_int(hash, snap->lunar_valid ? 1 : 0);
     hash = hash_int(hash, snap->lunar_year);
@@ -539,13 +555,16 @@ static void layout(const content_snapshot_t *snap, int ui_w, int ui_h)
     /* Status strip: battery, USB, address (awake only) and next wake. */
     char status[64];
     char work[32];
-    const int soc = axp2101_battery_percent();
+    const int soc = s_snap.soc;
     if (soc >= 0) {
         (void)snprintf(work, sizeof(work), "BATT %d%%", soc);
     } else {
         copy_text(work, sizeof(work), "BATT --");
     }
     copy_text(status, sizeof(status), work);
+    if (s_snap.low) {
+        strlcat(status, " LOW", sizeof(status));
+    }
     if (axp2101_is_usb_connected()) {
         strlcat(status, " USB", sizeof(status));
     }
@@ -566,6 +585,14 @@ static void layout(const content_snapshot_t *snap, int ui_w, int ui_h)
     s_layout.status_y = ui_h * 92 / 100;
     s_layout.status_w = text_width(s_snap.status, SCALE_STATUS);
     s_layout.status_x = centered_x(s_layout.status_w, ui_w);
+
+    /* Critical battery: one red line under the status strip. */
+    s_layout.charge_w = 0;
+    if (s_snap.charge_me) {
+        s_layout.charge_w = text_width("CHARGE ME", SCALE_SMALL);
+        s_layout.charge_x = centered_x(s_layout.charge_w, ui_w);
+        s_layout.charge_y = ui_h * 96 / 100;
+    }
 }
 
 static uint8_t page_pixel(int x, int y)
@@ -620,7 +647,13 @@ static uint8_t page_pixel(int x, int y)
     }
     if (glyph_at(s_snap.status, l->status_w, l->status_x, l->status_y,
                  SCALE_STATUS, x, y)) {
-        return SCREEN_COLOR_BLACK;
+        /* A low pack paints the whole status strip red, including the LOW tag. */
+        return s_snap.low ? SCREEN_COLOR_RED : SCREEN_COLOR_BLACK;
+    }
+    if (l->charge_w > 0 &&
+        glyph_at("CHARGE ME", l->charge_w, l->charge_x, l->charge_y,
+                 SCALE_SMALL, x, y)) {
+        return SCREEN_COLOR_RED;
     }
     return SCREEN_COLOR_WHITE;
 }

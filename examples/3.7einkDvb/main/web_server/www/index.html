@@ -608,6 +608,13 @@
       </div>
     </div>
 
+    <div v-if="authNeeded" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:10px 12px;margin:0 0 12px;border:1px solid var(--err);border-radius:10px;color:var(--err);font-size:.82rem;">
+      <span>该操作需要 API token</span>
+      <input type="password" v-model="authInput" autocomplete="off" placeholder="输入 token"
+        style="flex:1 1 160px;min-width:120px;" />
+      <button class="push" type="button" @click="adoptToken" style="flex:0 0 auto;">使用</button>
+    </div>
+
     <div class="picker">
       <span class="picker-key">配色</span>
       <button
@@ -632,11 +639,23 @@
       </div>
       <div class="meta-row" v-if="wifiMode === 'sta'">
         <span class="meta-key">地址</span>
+        <span class="meta-val mono">{{ deviceHostUrl }}</span>
+      </div>
+      <div class="meta-row" v-if="wifiMode === 'sta'">
+        <span class="meta-key">IP</span>
         <span class="meta-val mono">{{ wifiUrl }}</span>
       </div>
-      <div class="meta-row" v-else>
+      <div class="meta-row" v-if="wifiMode !== 'sta'">
+        <span class="meta-key">热点</span>
+        <span class="meta-val mono">{{ apSsid }}</span>
+      </div>
+      <div class="meta-row" v-if="wifiMode !== 'sta'">
+        <span class="meta-key">密码</span>
+        <span class="meta-val mono">{{ apPass }}</span>
+      </div>
+      <div class="meta-row" v-if="wifiMode !== 'sta'">
         <span class="meta-key">配网</span>
-        <span class="meta-val">选一个 Wi-Fi 填密码；连上后手机改连该网络，再扫屏幕上的二维码回到本页。</span>
+        <span class="meta-val">先用上面的密码连接设备热点；选一个 Wi-Fi 填密码，连上后手机改连该网络，再扫屏幕上的二维码回到本页。</span>
       </div>
     </div>
 
@@ -681,7 +700,24 @@
     </div>
 
     <div v-show="tab === 'settings'" class="panel">
-      <div class="field">充电档位</div>
+      <div class="field">网络与安全</div>
+      <p class="hint">设备热点 <span class="mono">{{ apSsid }}</span> · 当前密码 <span class="mono">{{ apPass }}</span>（STA 模式下热点关闭，密码会在下次开启时生效）</p>
+      <label>新的热点密码（8–63 个可打印 ASCII 字符）
+        <input type="text" maxlength="63" v-model="apPassInput" :disabled="apBusy" autocomplete="off" placeholder="留空则不修改" />
+      </label>
+      <button class="push" type="button" :disabled="apBusy" @click="saveApPassword">保存并重启热点</button>
+      <p class="hint">保存后热点立即用新密码重启，手机需要重新连接；屏幕同时刷新显示新的 SSID 和密码。长按 BOOT（GPIO28）5 秒再上电可恢复默认密码。</p>
+      <p class="status" :class="apStatusClass" role="status" aria-live="polite">{{ apStatus }}</p>
+
+      <label>API token（可选，8–64 个可打印 ASCII 字符，留空表示不启用）
+        <input type="text" maxlength="64" v-model="tokenInput" autocomplete="off" placeholder="当前值保存在本浏览器" />
+      </label>
+      <button class="push" type="button" :disabled="tokenBusy" @click="saveToken">保存 token</button>
+      <button class="push" type="button" :disabled="tokenBusy" @click="clearToken">清除 token</button>
+      <p class="hint">设备当前<span class="mono">{{ tokenSet ? '已启用 token' : '未启用 token' }}</span>。token 存在浏览器 localStorage，所有修改请求自动带 X-Auth-Token；启用后其它设备修改设置会收到 401。忘记 token 时长按 BOOT 5 秒上电清除。它只用于局域网防误操作，NVS 未加密，不是强安全边界。</p>
+      <p class="status" :class="tokenStatusClass" role="status" aria-live="polite">{{ tokenStatus }}</p>
+
+      <div class="field" style="margin-top:18px">充电档位</div>
       <label>电池额定容量（mAh）<input type="number" min="500" max="10000" step="1" v-model.number="chargeCapacity" @input="chargeDirty = true" :disabled="chargeBusy || !chargeReady" /></label>
       <button class="push" type="button" :disabled="chargeBusy || !chargeReady" @click="setChargePower(chargePower)">保存充电设置</button>
       <p class="hint">{{ chargeDetail }}</p>
@@ -1044,13 +1080,37 @@
     const cssOf = (id) => COLORS.find(c => c.id === id).css;
     const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 
+    /* ---- Optional API token ------------------------------------------------
+       Stored in localStorage only; the device stores the same string in NVS.
+       Every request carries X-Auth-Token so a 401 is always recoverable by
+       typing the token once, without a page reload. */
+    const TOKEN_KEY = 'eink.api.token.v1';
+    const tokenStore = {
+      get() { try { return localStorage.getItem(TOKEN_KEY) || ''; } catch (_) { return ''; } },
+      set(v) { try { v ? localStorage.setItem(TOKEN_KEY, v) : localStorage.removeItem(TOKEN_KEY); } catch (_) {} },
+    };
+    let notifyUnauthorized = () => {};
+    const apiFetch = (url, options = {}) => {
+      const headers = new Headers(options.headers || {});
+      const token = tokenStore.get();
+      if (token) headers.set('X-Auth-Token', token);
+      return fetch(url, { ...options, headers }).then((res) => {
+        if (res.status === 401) { try { notifyUnauthorized(); } catch (_) {} }
+        return res;
+      });
+    };
+
     const fetchJson = async (url, options = {}, timeoutMs = 15000) => {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), timeoutMs);
       try {
-        const res = await fetch(url, { ...options, signal: controller.signal });
+        const res = await apiFetch(url, { ...options, signal: controller.signal });
         const info = await res.json();
-        if (!res.ok || info.ok === false) throw new Error(info.message || `HTTP ${res.status}`);
+        if (!res.ok || info.ok === false) {
+          const err = new Error(info.message || info.error || `HTTP ${res.status}`);
+          err.status = res.status;
+          throw err;
+        }
         return info;
       } finally { clearTimeout(timer); }
     };
@@ -1104,6 +1164,120 @@
         const wifiBusy = ref(false);
         const wifiStatus = ref('');
         const wifiStatusClass = ref('');
+
+        /* ---- SoftAP credentials and API token ---------------------------- */
+        const apSsid = ref('Eink E6 3.7');
+        const apPass = ref('');
+        const deviceHost = ref('');
+        const deviceHostUrl = computed(() =>
+          (wifiMode.value === 'sta' && deviceHost.value) ? 'http://' + deviceHost.value : wifiUrl.value);
+        const apPassInput = ref('');
+        const apBusy = ref(false);
+        const apStatus = ref('');
+        const apStatusClass = ref('');
+        const tokenSet = ref(false);
+        const tokenInput = ref(tokenStore.get());
+        const tokenBusy = ref(false);
+        const tokenStatus = ref('');
+        const tokenStatusClass = ref('');
+        const authNeeded = ref(false);
+        const authInput = ref('');
+        notifyUnauthorized = () => {
+          authNeeded.value = true;
+          tokenStatusClass.value = 'err';
+          tokenStatus.value = '设备要求 API token，请填写后重试';
+        };
+        const adoptToken = () => {
+          const token = (authInput.value || '').trim();
+          if (!token) return;
+          tokenStore.set(token);
+          tokenInput.value = token;
+          authInput.value = '';
+          authNeeded.value = false;
+          tokenStatusClass.value = 'ok';
+          tokenStatus.value = '已应用该 token，请重新执行刚才的操作';
+          checkDevice();
+        };
+        const postToken = (token) => fetchJson('/api/token', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ token }),
+        }, 8000);
+        const saveToken = async () => {
+          const token = (tokenInput.value || '').trim();
+          if (token && (token.length < 8 || token.length > 64)) {
+            tokenStatusClass.value = 'err';
+            tokenStatus.value = 'token 需要 8–64 个可打印 ASCII 字符';
+            return;
+          }
+          tokenBusy.value = true;
+          try {
+            let info;
+            try {
+              info = await postToken(token);
+            } catch (e) {
+              /* A token is already set on the device: try the typed value as
+                 the current token, and put the old one back if that fails. */
+              if (e.status !== 401 || !token) throw e;
+              const previous = tokenStore.get();
+              tokenStore.set(token);
+              try {
+                info = await postToken(token);
+              } catch (e2) {
+                tokenStore.set(previous);
+                throw e2;
+              }
+            }
+            tokenStore.set(token);
+            tokenSet.value = !!info.token_set;
+            tokenStatusClass.value = 'ok';
+            tokenStatus.value = token ? 'token 已保存到设备' : 'token 已清除，API 恢复开放';
+            authNeeded.value = false;
+          } catch (e) {
+            tokenStatusClass.value = 'err';
+            tokenStatus.value = '保存失败：' + (e.message || e);
+          }
+          tokenBusy.value = false;
+        };
+        const clearToken = async () => {
+          tokenInput.value = '';
+          await saveToken();
+        };
+        const saveApPassword = async () => {
+          const pass = (apPassInput.value || '').trim();
+          if (pass.length < 8 || pass.length > 63) {
+            apStatusClass.value = 'err';
+            apStatus.value = '密码需要 8–63 个可打印 ASCII 字符';
+            return;
+          }
+          apBusy.value = true;
+          apStatusClass.value = '';
+          apStatus.value = '正在保存，热点即将重启…';
+          try {
+            const info = await fetchJson('/api/ap', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ password: pass }),
+            }, 8000);
+            apPass.value = pass;
+            apPassInput.value = '';
+            apStatusClass.value = 'ok';
+            apStatus.value = (info && info.msg) ? info.msg + '：请用新密码重新连接热点' : '已保存，请用新密码重新连接热点';
+          } catch (e) {
+            if (e.status === 401) {
+              apStatusClass.value = 'err';
+              apStatus.value = '需要 API token';
+            } else {
+              /* The AP restarted before the reply arrived; this is the normal
+                 outcome when the browser is connected through the SoftAP. */
+              apPass.value = pass;
+              apPassInput.value = '';
+              apStatusClass.value = 'ok';
+              apStatus.value = '热点已重启，请用新密码重新连接';
+            }
+          }
+          apBusy.value = false;
+        };
         const chargePower = ref('balanced');
         const chargeCapacity = ref(500);
         const chargeDirty = ref(false);
@@ -1291,7 +1465,7 @@
           contentStatus.value = '正在保存并刷新（约 23 秒）';
           try {
             await postContent();
-            const res = await fetch('/api/content/refresh', { method: 'POST' });
+            const res = await apiFetch('/api/content/refresh', { method: 'POST' });
             const job = await res.json().catch(() => null);
             if (!job || job.ok === false) throw new Error((job && job.error) || ('HTTP ' + res.status));
             if (!Number.isInteger(job.id)) throw new Error('设备协议不匹配');
@@ -1410,7 +1584,7 @@
           weatherStatus.value = '正在保存并抓取（约 30 秒）';
           try {
             await postWeather();
-            const res = await fetch('/api/weather/refresh', { method: 'POST' });
+            const res = await apiFetch('/api/weather/refresh', { method: 'POST' });
             const job = await res.json().catch(() => null);
             if (!job || job.ok === false) throw new Error((job && job.error) || ('HTTP ' + res.status));
             if (!Number.isInteger(job.id)) throw new Error('设备协议不匹配');
@@ -1518,7 +1692,7 @@
               slotImages[s.i] = null;
               if (s.valid) {
                 try {
-                  const res = await fetch('/api/slot?i=' + s.i, { cache: 'no-store' });
+                  const res = await apiFetch('/api/slot?i=' + s.i, { cache: 'no-store' });
                   const buf = res.ok ? new Uint8Array(await res.arrayBuffer()) : null;
                   if (buf && buf.length === 60 * 90 * 4) {
                     slotImages[s.i] = new ImageData(new Uint8ClampedArray(buf), 60, 90);
@@ -1552,7 +1726,7 @@
           tfBusy.value = true;
           tfStatusClass.value = '';
           try {
-            const res = await fetch('/api/tf', { cache: 'no-store' });
+            const res = await apiFetch('/api/tf', { cache: 'no-store' });
             if (res.status === 409) {
               tfStatus.value = '屏幕忙，稍后再试';
               tfStatusClass.value = 'err';
@@ -1604,7 +1778,7 @@
           phase.value = 'refresh';
           status.value = '正在从 TF 卡导入到槽位 ' + (f.target + 1) + '…';
           try {
-            const res = await fetch('/api/tf/import', {
+            const res = await apiFetch('/api/tf/import', {
               method: 'POST', headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ file: f.name, slot: f.target }),
             });
@@ -1638,7 +1812,7 @@
           const name = 'slot' + (s.i + 1) + '-' + Date.now() + '.bin';
           status.value = '正在导出槽位 ' + (s.i + 1) + ' 到 TF 卡…';
           try {
-            const res = await fetch('/api/tf/export', {
+            const res = await apiFetch('/api/tf/export', {
               method: 'POST', headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ slot: s.i, name }),
             });
@@ -2218,6 +2392,10 @@
             if (info.mode) wifiMode.value = info.mode;
             if (info.ssid) wifiSsid.value = info.ssid;
             if (info.url) wifiUrl.value = info.url;
+            if (info.host) deviceHost.value = info.host;
+            if (info.ap_ssid) apSsid.value = info.ap_ssid;
+            if (info.ap_pass) apPass.value = info.ap_pass;
+            if (typeof info.token_set === 'boolean') tokenSet.value = info.token_set;
             deviceUptimeMs.value = Number.isFinite(info.uptime_ms) ? info.uptime_ms : 0;
             deviceReset.value = info.reset_reason || '';
             // A failed frame job is otherwise lost when the HTTP reply was cut.
@@ -2384,6 +2562,9 @@
           deviceOnline, deviceBootText, renderStyle, renderStyles, previewBusy, usedColors, draggingFile,
           zoom, panX, panY, exposure, brightness, contrast, highlights, shadows, saturation,
           wifiMode, wifiSsid, wifiUrl, wifiList, selectedSsid, wifiPass, wifiBusy, wifiStatus, wifiStatusClass,
+          apSsid, apPass, deviceHost, deviceHostUrl, apPassInput, apBusy, apStatus, apStatusClass, saveApPassword,
+          tokenSet, tokenInput, tokenBusy, tokenStatus, tokenStatusClass, saveToken, clearToken,
+          authNeeded, authInput, adoptToken,
           chargeCapacity, chargeDirty, chargeReady, chargeDetail, gaugeDetail, chargePower, chargeBusy, chargeStatus, chargeStatusClass, chargeLevels,
           powerMode, powerInterval, powerDirty, powerReady, powerBusy, powerStatus, powerStatusClass, powerDetail, imuDetail,
           contentEnabled, contentNote0, contentNote1, contentDate, contentLabel,

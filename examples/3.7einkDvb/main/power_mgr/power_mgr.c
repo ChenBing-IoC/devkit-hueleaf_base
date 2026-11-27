@@ -548,8 +548,13 @@ void power_mgr_maintenance_session(void)
          * hook is documented as "no panel", and the page draw below must see
          * the fresh cache in this same pass. Disabled skips the network call
          * entirely; failure keeps the previous cache and never blocks sleep. */
+        const int soc = axp2101_battery_percent();
         weather_config_t weather_cfg = { 0 };
-        if (weather_config_get(&weather_cfg) == ESP_OK && weather_cfg.enabled) {
+        if (soc >= 0 && soc < 10) {
+            /* A scheduled wake below 10 % keeps the radio for SNTP only; the
+             * cached weather block is still published below. */
+            ESP_LOGW(TAG, "weather skipped: battery %d%% below 10%%", soc);
+        } else if (weather_config_get(&weather_cfg) == ESP_OK && weather_cfg.enabled) {
             const int64_t left = (int64_t)((deadline_us - esp_timer_get_time()) / 1000);
             if (left <= 0) {
                 ESP_LOGW(TAG, "weather skipped: no budget left");
@@ -562,7 +567,6 @@ void power_mgr_maintenance_session(void)
         } else {
             ESP_LOGI(TAG, "weather disabled, cached data only");
         }
-        const int soc = axp2101_battery_percent();
         ESP_LOGI(TAG, "maintenance battery %d%% usb=%d", soc,
                  axp2101_is_usb_connected() ? 1 : 0);
         if (s_maint_cb) {

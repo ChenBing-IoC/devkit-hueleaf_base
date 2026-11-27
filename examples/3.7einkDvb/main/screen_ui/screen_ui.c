@@ -54,6 +54,10 @@ typedef struct {
     int origin_y;
     const char *title;
     const char *url;
+    /* Setup page: the SoftAP SSID and password must be readable on the glass,
+     * otherwise a WPA2 AP locks the user out. */
+    const char *ssid;
+    const char *pass;
     /* Message page: lines[0] is the title, lines[1..3] the supporting text. */
     const char *lines[4];
     size_t sent;
@@ -66,6 +70,7 @@ static qr_stream_t s_stream;
 static int ui_width=SCREEN_WIDTH, ui_height=SCREEN_HEIGHT;
 static unsigned ui_rotation;
 static char saved_title[48], saved_url[96];
+static char saved_ssid[48], saved_pass[72];
 static char saved_lines[4][48];
 
 static int font_index(char c)
@@ -183,9 +188,15 @@ static void paint_column(qr_stream_t *s, int x)
             paint_message(s, x);
             return;
         }
-        draw_text_row(s->col, x, 240, "ready to setup", 4);
-        draw_text_row(s->col, x, 340, "WiFi AP OPEN", 4);
-        draw_text_row(s->col, x, 400, s->url, 3);
+        draw_text_row(s->col, x, 190, "ready to setup", 3);
+        draw_text_row(s->col, x, 260, "WiFi AP WPA2", 3);
+        if (s->ssid) {
+            draw_text_row(s->col, x, 330, s->ssid, 2);
+        }
+        if (s->pass) {
+            draw_text_row(s->col, x, 390, s->pass, 3);
+        }
+        draw_text_row(s->col, x, 470, s->url, 3);
         return;
     }
     for (int y = 0; y < ui_height; y++) {
@@ -272,7 +283,7 @@ esp_err_t screen_ui_show_link_qr(const char *title, const char *url)
     return err;
 }
 
-esp_err_t screen_ui_show_setup(const char *url)
+esp_err_t screen_ui_show_setup(const char *url, const char *ssid, const char *pass)
 {
     if (url == NULL || url[0] == 0) {
         return ESP_ERR_INVALID_ARG;
@@ -281,7 +292,11 @@ esp_err_t screen_ui_show_setup(const char *url)
     screen_rotation_size(ui_rotation, &ui_width, &ui_height);
     memset(&s_stream, 0, sizeof(s_stream));
     snprintf(saved_url, sizeof(saved_url), "%s", url);
+    snprintf(saved_ssid, sizeof(saved_ssid), "SSID %s", ssid ? ssid : "");
+    snprintf(saved_pass, sizeof(saved_pass), "PASS %s", pass ? pass : "");
     s_stream.url = saved_url;
+    s_stream.ssid = saved_ssid;
+    s_stream.pass = saved_pass;
     s_stream.last_x = -1;
     ESP_LOGI(TAG, "setup text %s", url);
     screen_rotation_note_external();

@@ -12,6 +12,7 @@
 #include "pcf8563.h"
 #include "msa321.h"
 #include "imu_app.h"
+#include "netcfg.h"
 #include "pin_map.h"
 #include "power_mgr.h"
 #include "screen_driver.h"
@@ -24,6 +25,11 @@
 
 static const char *TAG = "main";
 static TaskHandle_t s_screen_task;
+/* Set when the AP password changed from the web page: the next screen pass
+ * must show the setup text even if the standby page is enabled, otherwise the
+ * user sees a panel that no longer matches the password they just set. */
+static bool s_force_setup;
+static bool s_factory_reset;
 
 #define SCREEN_EVENT_NETWORK  (1u << 0)
 #define SCREEN_EVENT_PMIC_IRQ (1u << 1)
@@ -60,11 +66,12 @@ static esp_err_t setup_pmic_irq(void)
     return ESP_OK;
 }
 
-static void show_network_page(void)
+static void show_network_page(bool force_setup)
 {
-    char url[48], ip[16], strip[24];
+    char url[48], ip[16], strip[24], ap_pass[64];
     wifi_mgr_service_url(url, sizeof(url));
     wifi_mgr_get_ip(ip, sizeof(ip));
+    (void)netcfg_get_ap_password(ap_pass, sizeof(ap_pass));
     screen_rotation_lock();
     /* A deliberately blanked panel stays blank until the next key press. */
     if (screen_rotation_hidden()) {
@@ -73,9 +80,15 @@ static void show_network_page(void)
     }
     /* With the standby page enabled it is the primary screen, awake included:
      * it draws its own status line with the live address, so no picture and no
-     * driver overlay are needed. Pictures return only on BOOT or a gesture. */
+     * driver overlay are needed. Pictures return only on BOOT or a gesture.
+     * The exception is a password change: the AP credentials must be on the
+     * glass right away. */
     content_config_t content_cfg;
-    if (content_config_get(&content_cfg) == ESP_OK && content_cfg.enabled) {
+    const bool connected = wifi_mgr_is_sta_up();
+    /* Provisioning mode (AP only) always shows SSID + password: without
+     * the credentials on the glass the open setup page is unreachable. */
+    if (!force_setup && connected &&
+        content_config_get(&content_cfg) == ESP_OK && content_cfg.enabled) {
         const bool drawn = content_page_redraw(true);
         screen_rotation_unlock();
         if (!drawn) ESP_LOGW(TAG, "content page + address failed");
@@ -83,7 +96,7 @@ static void show_network_page(void)
     }
     /* Awake with a picture on the glass: the address strip is the awake marker.
      * Idle entry replaces the picture and drops the strip again. */
-    if (screen_rotation_has_images()) {
+    if (!force_setup && connected && screen_rotation_has_images()) {
         snprintf(strip, sizeof(strip), "%s %s", wifi_mgr_is_sta_up() ? "STA" : "AP", ip);
         screen_rotation_set_overlay(strip);
         esp_err_t err = screen_rotation_show_image();
@@ -92,10 +105,9 @@ static void show_network_page(void)
         return;
     }
     screen_rotation_set_overlay(NULL);
-    const bool connected = wifi_mgr_is_sta_up();
     ESP_LOGI(TAG, "screen %s  %s", connected ? "LAN QR" : "setup text", url);
     esp_err_t err = connected ? screen_ui_show_link_qr("Scan to upload", url)
-                              : screen_ui_show_setup(url);
+                              : screen_ui_show_setup(url, WIFI_AP_SSID, ap_pass);
     screen_rotation_unlock();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "network page failed: %s", esp_err_to_name(err));
@@ -144,18 +156,33 @@ static void screen_task(void *arg)
                 ESP_LOGI(TAG, "PWRON screen %s", hidden ? "white (source retained)" : "image restored");
                 /* Unblanking after a sleep may find no strip stored yet; the
                  * network page adds it (and is a no-op when already there). */
-                if (!hidden && shows_image) show_network_page();
+                if (!hidden && shows_image) show_network_page(s_force_setup);
             } else {
                 ESP_LOGE(TAG, "PWRON toggle failed: %s", esp_err_to_name(err));
             }
         } else if (events & SCREEN_EVENT_NETWORK) {
-            show_network_page();
+            show_network_page(s_force_setup);
+            s_force_setup = false;
         }
     }
 }
 
 static void on_lan_ready(void)
 {
+    if (s_screen_task) {
+        xTaskNotify(s_screen_task, SCREEN_EVENT_NETWORK, eSetBits);
+    }
+}
+
+/* Called from the HTTP task after the AP password changed. Only the running
+ * SoftAP needs the credentials on the glass; in STA mode the standby page
+ * stays as it is. */
+static void on_net_config_changed(void)
+{
+    if (!wifi_mgr_is_ap_up()) {
+        return;
+    }
+    s_force_setup = true;
     if (s_screen_task) {
         xTaskNotify(s_screen_task, SCREEN_EVENT_NETWORK, eSetBits);
     }
@@ -170,6 +197,18 @@ void app_main(void)
      * before the RTC restore so every localtime_r() call agrees. */
     setenv("TZ", "CST-8", 1);
     tzset();
+
+    /* Network identity first: the AP password and API token live in NVS, and
+     * the BOOT safety valve has to run before the radio comes up. A normal tap
+     * only costs the two GPIO reads below. */
+    esp_err_t net_err = netcfg_init();
+    if (net_err != ESP_OK) {
+        ESP_LOGW(TAG, "netcfg init: %s", esp_err_to_name(net_err));
+    }
+    s_factory_reset = netcfg_boot_recovery();
+    if (s_factory_reset) {
+        ESP_LOGW(TAG, "factory reset from BOOT long press");
+    }
 
     /* First: the stored sleep policy, the deep sleep wake pins and the reason
      * this boot happened decide between the interactive and the maintenance
@@ -266,13 +305,25 @@ void app_main(void)
 
     ESP_ERROR_CHECK(screen_driver_init());
     ESP_ERROR_CHECK(screen_rotation_init());
+    if (s_factory_reset) {
+        /* Keep the notice on the glass long enough to read before the setup
+         * page (which shows the new default password) replaces it. */
+        (void)screen_ui_show_message("FACTORY RESET", "SECRETS CLEARED",
+                                     "AP PASS DEFAULT", "WIFI SETUP NEEDED");
+        vTaskDelay(pdMS_TO_TICKS(8000));
+        /* The setup page (SSID + new password) must win over the standby
+         * page until the credentials are back on the router. */
+        s_force_setup = true;
+    }
     ESP_ERROR_CHECK(wifi_mgr_start());
     ESP_ERROR_CHECK(web_server_start());
     if (xTaskCreate(screen_task, "screen_ui", 4096, NULL, 3, &s_screen_task) != pdPASS) {
         ESP_LOGE(TAG, "screen task; PWRON clear unavailable");
-        show_network_page();
+        s_screen_task = NULL;
+        show_network_page(s_force_setup);
     } else {
         wifi_mgr_set_ready_cb(on_lan_ready);
+        web_server_set_net_changed_cb(on_net_config_changed);
         xTaskNotify(s_screen_task, SCREEN_EVENT_NETWORK, eSetBits);
     }
 
