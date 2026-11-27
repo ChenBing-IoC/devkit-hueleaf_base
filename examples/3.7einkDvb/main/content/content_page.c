@@ -80,9 +80,11 @@ static const char *const k_month[12] = {
     "JUL", "AUG", "SEP", "OCT", "NOV", "DEC",
 };
 
-/* The weather block is a placeholder until the Open-Meteo follow-up (#5b)
- * calls content_page_set_weather() before a draw. */
-static char s_weather[CONTENT_WEATHER_MAX + 1] = "WEATHER --";
+/* Weather block; weather_publish_page() fills it from the cache before a draw.
+ * Empty detail and forecast select the single-line placeholder. */
+static char s_weather_main[CONTENT_WEATHER_MAIN_MAX + 1] = "WEATHER --";
+static char s_weather_detail[CONTENT_WEATHER_DETAIL_MAX + 1];
+static char s_weather_forecast[CONTENT_WEATHER_FORECAST_MAX + 1];
 static volatile bool s_refreshed;
 
 /* Strings shown by the current draw, independent of layout. */
@@ -93,6 +95,8 @@ typedef struct {
     char lunar[24];
     char term[24];
     char weather[24];
+    char weather_detail[40];
+    char weather_forecast[80];
     char countdown[28];
     char label[20];
     char note[CONTENT_NOTE_LINES][34];
@@ -117,6 +121,9 @@ typedef struct {
     int lunar_x, lunar_y, lunar_w;
     int term_x, term_y, term_w;
     int weather_x, weather_y, weather_w;
+    int detail_x, detail_y, detail_w, detail_scale;
+    int forecast_x, forecast_y, forecast_w, forecast_scale;
+    bool weather_split;
     int count_x, count_y, count_w;
     int label_x, label_y, label_w;
     int note_x, note0_y, note1_y, note_w[CONTENT_NOTE_LINES];
@@ -181,6 +188,20 @@ static void copy_text(char *dst, size_t size, const char *src)
     if (length >= size) length = size - 1;
     memcpy(dst, src, length);
     dst[length] = '\0';
+}
+
+/* Printable ASCII only; anything else becomes a space and trailing spaces are
+ * dropped, so a malformed source cannot paint a control glyph. */
+static void copy_ascii(char *dst, size_t size, const char *src)
+{
+    size_t length = src ? strlen(src) : 0;
+    if (length >= size) length = size - 1;
+    for (size_t i = 0; i < length; ++i) {
+        const unsigned char c = (unsigned char)src[i];
+        dst[i] = (c >= 0x20 && c <= 0x7E) ? (char)c : ' ';
+    }
+    dst[length] = '\0';
+    while (length > 0 && dst[length - 1] == ' ') dst[--length] = '\0';
 }
 
 /* ---- Configuration ------------------------------------------------------- */
@@ -260,21 +281,30 @@ esp_err_t content_config_set(const content_config_t *cfg)
     return err;
 }
 
-void content_page_set_weather(const char *text)
+void content_page_set_weather_lines(const char *main_line, const char *detail_line,
+                                    const char *forecast_line)
 {
-    if (!text || !text[0]) {
-        copy_text(s_weather, sizeof(s_weather), "WEATHER --");
+    char main_text[CONTENT_WEATHER_MAIN_MAX + 1];
+    char detail_text[CONTENT_WEATHER_DETAIL_MAX + 1];
+    char forecast_text[CONTENT_WEATHER_FORECAST_MAX + 1];
+    copy_ascii(main_text, sizeof(main_text), main_line);
+    copy_ascii(detail_text, sizeof(detail_text), detail_line);
+    copy_ascii(forecast_text, sizeof(forecast_text), forecast_line);
+
+    if (main_text[0] == '\0') {
+        copy_text(s_weather_main, sizeof(s_weather_main), "WEATHER --");
+        s_weather_detail[0] = '\0';
+        s_weather_forecast[0] = '\0';
         return;
     }
-    char clean[CONTENT_WEATHER_MAX + 1];
-    size_t length = strlen(text);
-    if (length > CONTENT_WEATHER_MAX) length = CONTENT_WEATHER_MAX;
-    for (size_t i = 0; i < length; ++i) {
-        const unsigned char c = (unsigned char)text[i];
-        clean[i] = (c >= 0x20 && c <= 0x7E) ? (char)c : ' ';
-    }
-    clean[length] = '\0';
-    copy_text(s_weather, sizeof(s_weather), clean);
+    copy_text(s_weather_main, sizeof(s_weather_main), main_text);
+    copy_text(s_weather_detail, sizeof(s_weather_detail), detail_text);
+    copy_text(s_weather_forecast, sizeof(s_weather_forecast), forecast_text);
+}
+
+void content_page_set_weather(const char *text)
+{
+    content_page_set_weather_lines(text, NULL, NULL);
 }
 
 /* ---- Snapshot and fingerprint -------------------------------------------- */
@@ -290,7 +320,9 @@ static void snapshot_build(const content_config_t *cfg, bool with_status,
         copy_text(snap->note[i], sizeof(snap->note[i]), cfg->note[i]);
         snap->has_note[i] = snap->note[i][0] != '\0';
     }
-    copy_text(snap->weather, sizeof(snap->weather), s_weather);
+    copy_text(snap->weather, sizeof(snap->weather), s_weather_main);
+    copy_text(snap->weather_detail, sizeof(snap->weather_detail), s_weather_detail);
+    copy_text(snap->weather_forecast, sizeof(snap->weather_forecast), s_weather_forecast);
 
     time_t now = time(NULL);
     struct tm local;
@@ -372,7 +404,7 @@ static uint32_t hash_int(uint32_t hash, int value)
 static uint32_t snapshot_hash(const content_snapshot_t *snap)
 {
     uint32_t hash = 2166136261U;
-    hash = hash_str(hash, "content-v1");
+    hash = hash_str(hash, "content-v2");
     hash = hash_int(hash, snap->with_status ? 1 : 0);
     hash = hash_str(hash, snap->iso);
     hash = hash_int(hash, snap->lunar_valid ? 1 : 0);
@@ -387,6 +419,8 @@ static uint32_t snapshot_hash(const content_snapshot_t *snap)
     hash = hash_str(hash, snap->note[0]);
     hash = hash_str(hash, snap->note[1]);
     hash = hash_str(hash, snap->weather);
+    hash = hash_str(hash, snap->weather_detail);
+    hash = hash_str(hash, snap->weather_forecast);
     return hash;
 }
 
@@ -400,6 +434,23 @@ uint32_t content_page_fingerprint(bool with_status)
 }
 
 /* ---- Layout and pixel fill ----------------------------------------------- */
+
+/* Drops trailing words until the text fits max_width at scale. The weather
+ * forecast loses whole days ("FRI 21/10") instead of being cut mid-number. */
+static void fit_text(char *text, int max_width, int scale)
+{
+    size_t length = strlen(text);
+    while (length > 0 && text_width(text, scale) > max_width) {
+        size_t cut = length;
+        while (cut > 0 && text[cut - 1] != ' ') --cut;
+        if (cut > 1) {
+            text[cut - 1] = '\0';
+            length = cut - 1;
+        } else {
+            text[--length] = '\0';
+        }
+    }
+}
 
 static void layout(const content_snapshot_t *snap, int ui_w, int ui_h)
 {
@@ -428,10 +479,47 @@ static void layout(const content_snapshot_t *snap, int ui_w, int ui_h)
     s_layout.box_x1 = ui_w - 40;
     s_layout.box_y0 = ui_h * 37 / 100;
     s_layout.box_y1 = ui_h * 58 / 100;
+    const int box_h = s_layout.box_y1 - s_layout.box_y0;
+    const int inner_w = (s_layout.box_x1 - s_layout.box_x0) - 20;
+    s_layout.weather_split = s_snap.weather_detail[0] != '\0' ||
+                             s_snap.weather_forecast[0] != '\0';
     s_layout.weather_w = text_width(s_snap.weather, SCALE_DATE);
     s_layout.weather_x = centered_x(s_layout.weather_w, ui_w);
-    s_layout.weather_y = s_layout.box_y0 +
-        ((s_layout.box_y1 - s_layout.box_y0) - FONT_H * SCALE_DATE) / 2;
+    s_layout.detail_scale = SCALE_SMALL;
+    s_layout.forecast_scale = SCALE_NOTE;
+    if (!s_layout.weather_split) {
+        s_layout.weather_y = s_layout.box_y0 +
+            (box_h - FONT_H * SCALE_DATE) / 2;
+    } else {
+        /* Main line large on top, detail in the middle, forecast at the
+         * bottom. Every line is fitted inside the box before drawing. */
+        s_layout.detail_w = text_width(s_snap.weather_detail, s_layout.detail_scale);
+        if (s_layout.detail_w > inner_w) {
+            s_layout.detail_scale = SCALE_NOTE;
+            s_layout.detail_w = text_width(s_snap.weather_detail, s_layout.detail_scale);
+        }
+        if (s_layout.detail_w > inner_w) {
+            fit_text(s_snap.weather_detail, inner_w, s_layout.detail_scale);
+            s_layout.detail_w = text_width(s_snap.weather_detail, s_layout.detail_scale);
+        }
+        s_layout.detail_x = centered_x(s_layout.detail_w, ui_w);
+
+        s_layout.forecast_w = text_width(s_snap.weather_forecast, s_layout.forecast_scale);
+        if (s_layout.forecast_w > inner_w) {
+            fit_text(s_snap.weather_forecast, inner_w, s_layout.forecast_scale);
+            s_layout.forecast_w = text_width(s_snap.weather_forecast, s_layout.forecast_scale);
+        }
+        s_layout.forecast_x = centered_x(s_layout.forecast_w, ui_w);
+
+        const int main_h = FONT_H * SCALE_DATE;
+        const int detail_h = FONT_H * s_layout.detail_scale;
+        const int forecast_h = FONT_H * s_layout.forecast_scale;
+        int gap = (box_h - (main_h + detail_h + forecast_h)) / 4;
+        if (gap < 4) gap = 4;
+        s_layout.weather_y = s_layout.box_y0 + gap;
+        s_layout.detail_y = s_layout.weather_y + main_h + gap;
+        s_layout.forecast_y = s_layout.detail_y + detail_h + gap;
+    }
 
     s_layout.count_y = ui_h * 63 / 100;
     s_layout.count_w = text_width(s_snap.countdown, SCALE_COUNT);
@@ -502,6 +590,16 @@ static uint8_t page_pixel(int x, int y)
     }
     if (glyph_at(s_snap.weather, l->weather_w, l->weather_x, l->weather_y,
                  SCALE_DATE, x, y)) {
+        return SCREEN_COLOR_BLACK;
+    }
+    if (l->weather_split &&
+        glyph_at(s_snap.weather_detail, l->detail_w, l->detail_x, l->detail_y,
+                 l->detail_scale, x, y)) {
+        return SCREEN_COLOR_BLACK;
+    }
+    if (l->weather_split &&
+        glyph_at(s_snap.weather_forecast, l->forecast_w, l->forecast_x,
+                 l->forecast_y, l->forecast_scale, x, y)) {
         return SCREEN_COLOR_BLACK;
     }
     if (glyph_at(s_snap.countdown, l->count_w, l->count_x, l->count_y,

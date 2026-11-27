@@ -741,6 +741,23 @@
       <p class="hint">醒着和待机都优先显示信息页：日期、最近刷新时间、农历与节气、倒计时和便签，醒着时状态行带 IP；BOOT 键仍切换到图片。定时唤醒只在内容（跨日、便签、倒计时、天气）变化时整屏刷新一次。</p>
       <p class="status" :class="contentStatusClass" role="status" aria-live="polite">{{ contentStatus }}</p>
 
+      <div class="field" style="margin-top:18px">天气（Open-Meteo）</div>
+      <label>纬度
+        <input type="number" step="0.0001" min="-90" max="90" v-model.number="weatherLat" :disabled="weatherBusy || !weatherReady" />
+      </label>
+      <label>经度
+        <input type="number" step="0.0001" min="-180" max="180" v-model.number="weatherLon" :disabled="weatherBusy || !weatherReady" />
+      </label>
+      <label>城市标签
+        <input type="text" maxlength="16" v-model="weatherLabel" :disabled="weatherBusy || !weatherReady" placeholder="例如 BEIJING，可留空" />
+      </label>
+      <label><input type="checkbox" v-model="weatherEnabled" :disabled="weatherBusy || !weatherReady" /> 定时唤醒时抓取天气</label>
+      <button class="push" type="button" :disabled="weatherBusy || !weatherReady" @click="saveWeather()">保存天气设置</button>
+      <button class="push" type="button" :disabled="weatherBusy || !weatherReady" @click="fetchWeatherNow">立即获取天气（抓取 + 刷屏，约 30 秒）</button>
+      <p class="hint">{{ weatherDetail }}</p>
+      <p class="hint">来源 Open-Meteo（免 API key，需联网）。设备只发送经纬度，不带任何标识；抓取失败会保留上次数据并记录错误，不会阻塞深睡。</p>
+      <p class="status" :class="weatherStatusClass" role="status" aria-live="polite">{{ weatherStatus }}</p>
+
     </div>
 
     <div v-show="tab === 'text' || tab === 'image'" class="editor-layout">
@@ -1289,6 +1306,135 @@
             contentStatusClass.value = 'err';
           }
           contentBusy.value = false;
+        };
+        /* 天气：配置与缓存，接口见 /api/weather。 */
+        const weatherLat = ref(39.9042);
+        const weatherLon = ref(116.4074);
+        const weatherLabel = ref('');
+        const weatherEnabled = ref(true);
+        const weatherReady = ref(false);
+        const weatherBusy = ref(false);
+        const weatherStatus = ref('');
+        const weatherStatusClass = ref('');
+        const weatherDetail = ref('正在读取天气配置');
+        const applyWeatherInfo = (info, saved = false) => {
+          if (saved || !weatherReady.value) {
+            weatherLat.value = Number.isFinite(info.lat) ? info.lat : 39.9042;
+            weatherLon.value = Number.isFinite(info.lon) ? info.lon : 116.4074;
+            weatherLabel.value = info.label || '';
+            weatherEnabled.value = !!info.enabled;
+          }
+          weatherReady.value = true;
+          let text = info.enabled ? '抓取已启用' : '抓取已关闭';
+          if (info.has_data) {
+            const when = info.observed_at ? new Date(info.observed_at * 1000).toLocaleString() : '时间未知';
+            text += ' · 最近观测 ' + when + ' · ' + (info.temp_c ?? '--') + 'C ' + (info.text || 'N/A') +
+              ' · H ' + info.today_max + ' L ' + info.today_min;
+          } else {
+            text += ' · 尚无缓存，屏幕显示 WEATHER --';
+          }
+          if (info.last_error) {
+            text += ' · 最近错误：' + info.last_error;
+            if (info.last_error_at) text += '（' + new Date(info.last_error_at * 1000).toLocaleString() + '）';
+          }
+          weatherDetail.value = text;
+        };
+        let weatherInFlight = false;
+        const refreshWeather = async () => {
+          if (weatherInFlight || weatherBusy.value) return;
+          weatherInFlight = true;
+          try {
+            const info = await fetchJson('/api/weather', { cache: 'no-store' }, 5000);
+            if (info.ok) applyWeatherInfo(info);
+          } catch (_) {
+            weatherDetail.value = '天气配置离线';
+          }
+          weatherInFlight = false;
+        };
+        const validateWeatherForm = () => {
+          if (!Number.isFinite(weatherLat.value) || weatherLat.value < -90 || weatherLat.value > 90) {
+            weatherStatus.value = '纬度需在 -90 到 90 之间';
+            weatherStatusClass.value = 'err';
+            return false;
+          }
+          if (!Number.isFinite(weatherLon.value) || weatherLon.value < -180 || weatherLon.value > 180) {
+            weatherStatus.value = '经度需在 -180 到 180 之间';
+            weatherStatusClass.value = 'err';
+            return false;
+          }
+          if (!contentTextOk(weatherLabel.value, 16)) {
+            weatherStatus.value = '城市标签只支持英文、数字和常见符号，最多 16 字符';
+            weatherStatusClass.value = 'err';
+            return false;
+          }
+          if (!weatherEnabled.value) {
+            weatherStatus.value = '天气抓取已关闭，勾选「定时唤醒时抓取天气」后再试';
+            weatherStatusClass.value = 'err';
+            return false;
+          }
+          return true;
+        };
+        const postWeather = async () => {
+          const info = await fetchJson('/api/weather', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              lat: weatherLat.value, lon: weatherLon.value,
+              label: weatherLabel.value, enabled: weatherEnabled.value,
+            }),
+          });
+          applyWeatherInfo(info, true);
+          return info;
+        };
+        const saveWeather = async () => {
+          if (weatherBusy.value || !weatherReady.value) return;
+          if (!validateWeatherForm()) return;
+          weatherBusy.value = true;
+          weatherStatusClass.value = '';
+          weatherStatus.value = '正在保存';
+          try {
+            await postWeather();
+            weatherStatus.value = '天气设置已保存';
+            weatherStatusClass.value = 'ok';
+          } catch (e) {
+            weatherStatus.value = '保存失败，请重试';
+            weatherStatusClass.value = 'err';
+          }
+          weatherBusy.value = false;
+        };
+        const fetchWeatherNow = async () => {
+          if (weatherBusy.value || !weatherReady.value) return;
+          if (!validateWeatherForm()) return;
+          weatherBusy.value = true;
+          weatherStatusClass.value = '';
+          weatherStatus.value = '正在保存并抓取（约 30 秒）';
+          try {
+            await postWeather();
+            const res = await fetch('/api/weather/refresh', { method: 'POST' });
+            const job = await res.json().catch(() => null);
+            if (!job || job.ok === false) throw new Error((job && job.error) || ('HTTP ' + res.status));
+            if (!Number.isInteger(job.id)) throw new Error('设备协议不匹配');
+            const done = await pollTfJob(job.id, 60000);
+            if (done.kind !== 'weather') throw new Error('刷新完成凭据不匹配');
+            const info = await fetchJson('/api/weather', { cache: 'no-store' }, 5000);
+            if (info.ok) applyWeatherInfo(info);
+            weatherStatus.value = info.has_data ? '天气已更新，屏幕正在显示新数据' : '天气已更新';
+            weatherStatusClass.value = 'ok';
+          } catch (e) {
+            let reason = e.message || e;
+            /* The job error is only an esp_err number; prefer the device's
+             * human-readable last_error for the message. */
+            try {
+              const info = await fetchJson('/api/weather', { cache: 'no-store' }, 5000);
+              if (info.ok) {
+                applyWeatherInfo(info);
+                if (info.last_error) reason = info.last_error;
+              }
+            } catch (_) { /* keep the job message */ }
+            weatherStatus.value = '抓取失败：' + reason;
+            weatherStatusClass.value = 'err';
+          }
+          weatherBusy.value = false;
         };
         const text = ref('你好，Eink');
         const bg = ref(0x1);
@@ -1870,7 +2016,7 @@
           clearTimeout(ditherTimer);
           previewBusy.value = false;
           tab.value = t;
-          if (t === 'settings') { refreshImu(); refreshContent(); }
+          if (t === 'settings') { refreshImu(); refreshContent(); refreshWeather(); }
           else if (t === 'image') refreshTf();
           nextTick(() => {
             if (t === 'text') renderText();
@@ -2242,6 +2388,8 @@
           powerMode, powerInterval, powerDirty, powerReady, powerBusy, powerStatus, powerStatusClass, powerDetail, imuDetail,
           contentEnabled, contentNote0, contentNote1, contentDate, contentLabel,
           contentReady, contentBusy, contentStatus, contentStatusClass, contentDetail,
+          weatherLat, weatherLon, weatherLabel, weatherEnabled, weatherReady, weatherBusy,
+          weatherStatus, weatherStatusClass, weatherDetail, saveWeather, fetchWeatherNow, refreshWeather,
           wakeIntervals, sleepModes, savePower, saveContent, refreshContentPage,
           switchTab, renderText, onFileChange, onDrop, push, setQuant, setDitherQuality, setRenderStyle,
           clearDisplay,

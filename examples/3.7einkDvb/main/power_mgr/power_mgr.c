@@ -24,6 +24,7 @@
 #include "screen_rotation.h"
 #include "screen_ui.h"
 #include "tf_card.h"
+#include "weather.h"
 #include "web_server.h"
 #include "wifi_mgr.h"
 
@@ -543,6 +544,24 @@ void power_mgr_maintenance_session(void)
         } else {
             ESP_LOGW(TAG, "SNTP not synced");
         }
+        /* Weather is a direct step after SNTP, not an s_maint_cb hook: the
+         * hook is documented as "no panel", and the page draw below must see
+         * the fresh cache in this same pass. Disabled skips the network call
+         * entirely; failure keeps the previous cache and never blocks sleep. */
+        weather_config_t weather_cfg = { 0 };
+        if (weather_config_get(&weather_cfg) == ESP_OK && weather_cfg.enabled) {
+            const int64_t left = (int64_t)((deadline_us - esp_timer_get_time()) / 1000);
+            if (left <= 0) {
+                ESP_LOGW(TAG, "weather skipped: no budget left");
+            } else {
+                const uint32_t timeout = left < (int64_t)WEATHER_FETCH_TIMEOUT_MS
+                                             ? (uint32_t)left : WEATHER_FETCH_TIMEOUT_MS;
+                const esp_err_t weather_err = weather_fetch(timeout);
+                ESP_LOGI(TAG, "weather fetch %s", esp_err_to_name(weather_err));
+            }
+        } else {
+            ESP_LOGI(TAG, "weather disabled, cached data only");
+        }
         const int soc = axp2101_battery_percent();
         ESP_LOGI(TAG, "maintenance battery %d%% usb=%d", soc,
                  axp2101_is_usb_connected() ? 1 : 0);
@@ -551,6 +570,10 @@ void power_mgr_maintenance_session(void)
         }
         (void)wifi_mgr_suspend();
     }
+
+    /* Publish even after a failed fetch: the page then shows the previous
+     * cache or the WEATHER -- placeholder. */
+    weather_publish_page();
 
     /* Panel init is on demand: an unchanged page must not touch SPI, the image
      * slots or the glass. The RTC still gives a usable local date when the

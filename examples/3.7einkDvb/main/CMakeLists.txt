@@ -12,6 +12,7 @@ idf_component_register(
         "screen_ui/screen_ui.c"
         "content/lunar.c"
         "content/content_page.c"
+        "content/weather.c"
         "qrcode/qrcode.c"
         "tf_card/tf_card.c"
         "wifi_mgr/wifi_mgr.c"
@@ -34,6 +35,8 @@ idf_component_register(
         "web_server"
     PRIV_REQUIRES
         json
+        mbedtls
+        esp_http_client
         esp_driver_spi
         esp_driver_gpio
         esp_driver_i2c

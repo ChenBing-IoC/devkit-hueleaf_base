@@ -18,6 +18,7 @@
 #include "screen_ui.h"
 #include "screen_rotation.h"
 #include "tf_card.h"
+#include "weather.h"
 #include "web_server.h"
 #include "wifi_mgr.h"
 
@@ -174,6 +175,11 @@ void app_main(void)
      * this boot happened decide between the interactive and the maintenance
      * session, so both are known before any subsystem starts. */
     power_mgr_boot_init();
+
+    /* Seed the weather block from the NVS cache before the first page draw.
+     * Interactive boots never fetch at startup: the radio and the panel come
+     * up faster without a TLS handshake, and the cache survives deep sleep. */
+    weather_publish_page();
 
     esp_err_t board_err = board_init();
 

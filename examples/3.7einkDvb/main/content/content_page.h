@@ -12,6 +12,9 @@
 #define CONTENT_LABEL_MAX  16
 #define CONTENT_DATE_MAX   10
 #define CONTENT_WEATHER_MAX 23
+#define CONTENT_WEATHER_MAIN_MAX     23
+#define CONTENT_WEATHER_DETAIL_MAX   39
+#define CONTENT_WEATHER_FORECAST_MAX 79
 
 /* Persisted under NVS namespace "content". The information page is a firmware
  * page: it never consumes a picture slot. */
@@ -30,8 +33,18 @@ esp_err_t content_config_set(const content_config_t *cfg);
 /* True for printable ASCII (0x20..0x7e, no quote/backslash) within max. */
 bool content_config_note_ok(const char *text, size_t max);
 
-/* Weather block input for the network-content follow-up (#5b). Empty or NULL
- * restores the "--" placeholder. The text is part of the fingerprint. */
+/* Weather block input: main line ("18C CLEAR", large), detail line
+ * ("H 22 L 11 OBS 14:32", small) and forecast line ("TOD 22/11 WED ...",
+ * small). NULL or empty main_line restores the single "WEATHER --" placeholder
+ * and clears the other two. Every non-empty segment is part of the
+ * fingerprint. The renderer truncates an over-wide forecast at a word
+ * boundary instead of overflowing the frame. */
+void content_page_set_weather_lines(const char *main_line, const char *detail_line,
+                                    const char *forecast_line);
+
+/* Deprecated: single-line form, equivalent to
+ * content_page_set_weather_lines(text, NULL, NULL). */
+__attribute__((deprecated("use content_page_set_weather_lines")))
 void content_page_set_weather(const char *text);
 
 /* Fingerprint of everything the page shows except the live clock and the

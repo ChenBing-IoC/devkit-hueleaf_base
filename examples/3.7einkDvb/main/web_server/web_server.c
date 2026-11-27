@@ -27,6 +27,7 @@
 #include "screen_driver.h"
 #include "screen_ui.h"
 #include "tf_card.h"
+#include "weather.h"
 #include "wifi_mgr.h"
 #include "lwip/sockets.h"
 
@@ -35,7 +36,7 @@ static const char *TAG = "web";
 typedef enum { JOB_IDLE, JOB_REFRESH, JOB_RECEIVING, JOB_ERROR } job_phase_t;
 typedef enum {
     JOB_FRAME, JOB_CLEAR_SCREEN, JOB_TF_IMPORT, JOB_TF_EXPORT, JOB_PANEL_PROBE,
-    JOB_CONTENT
+    JOB_CONTENT, JOB_WEATHER
 } job_kind_t;
 #define FRAME_FORMAT "otp6-v1"
 #define FRAME_CHUNK_BYTES 2048
@@ -100,6 +101,7 @@ static const char *job_kind_name(job_kind_t kind)
     case JOB_TF_EXPORT: return "tf-export";
     case JOB_PANEL_PROBE: return "panel-probe";
     case JOB_CONTENT: return "content";
+    case JOB_WEATHER: return "weather";
     default: return "frame";
     }
 }
@@ -111,6 +113,7 @@ static const char *job_sequence(job_kind_t kind)
     case JOB_TF_EXPORT: return "tf-export-v1";
     case JOB_PANEL_PROBE: return "panel-probe-v1";
     case JOB_CONTENT: return "content-page-v1";
+    case JOB_WEATHER: return "weather-v1";
     default: return FRAME_FORMAT;
     }
 }
@@ -1028,6 +1031,31 @@ static void frame_job_task(void *arg)
                      (unsigned)content_report.total_ms);
             continue;
         }
+        if (kind == JOB_WEATHER) {
+            const TickType_t weather_started = xTaskGetTickCount();
+            weather_config_t weather_cfg = { 0 };
+            (void)weather_config_get(&weather_cfg);
+            const esp_err_t fetch_err = weather_cfg.enabled
+                ? weather_fetch(WEATHER_FETCH_TIMEOUT_MS) : ESP_ERR_INVALID_STATE;
+            /* The page is redrawn from the cache even when the fetch failed. */
+            weather_publish_page();
+            screen_upload_report_t weather_report = {0};
+            screen_rotation_lock();
+            const bool drawn = content_page_redraw(true);
+            screen_rotation_unlock();
+            weather_report.total_ms = (uint32_t)((xTaskGetTickCount() - weather_started) *
+                                                 portTICK_PERIOD_MS);
+            weather_report.refresh_ms = weather_report.total_ms;
+            weather_report.completed = drawn;
+            weather_report.display_generation = screen_driver_generation();
+            const esp_err_t weather_job_err =
+                fetch_err != ESP_OK ? fetch_err : (drawn ? ESP_OK : ESP_FAIL);
+            finish_job(weather_job_err, &weather_report);
+            ESP_LOGI(TAG, "job weather fetch=%s draw=%d (%u ms)",
+                     esp_err_to_name(fetch_err), (int)drawn,
+                     (unsigned)weather_report.total_ms);
+            continue;
+        }
         if (kind == JOB_TF_IMPORT || kind == JOB_TF_EXPORT) {
             const tf_pending_t tf = s_tf_pending;
             screen_upload_report_t tf_report = {0};
@@ -1410,6 +1438,175 @@ static esp_err_t content_refresh_post_handler(httpd_req_t *req)
     return send_job_json(req);
 }
 
+/* ---- Weather page (Open-Meteo) ------------------------------------------- */
+
+static char s_weather_json[1400];
+
+static int append_int_json(char *dst, size_t capacity, int used, long value)
+{
+    char text[24];
+    const int n = snprintf(text, sizeof(text), "%ld", value);
+    if (n < 0 || (size_t)n >= sizeof(text)) return -1;
+    return append_lit(dst, capacity, used, text);
+}
+
+/* Fixed-point degrees (x 10000) to the JSON number "39.9042". */
+static int append_coord(char *dst, size_t capacity, int used, int32_t e4)
+{
+    char text[24];
+    weather_coord_text(e4, text, sizeof(text));
+    return append_lit(dst, capacity, used, text);
+}
+
+static esp_err_t send_weather_json(httpd_req_t *req)
+{
+    weather_config_t cfg;
+    weather_cache_t cache;
+    (void)weather_config_get(&cfg);
+    weather_cache_get(&cache);
+
+    char *json = s_weather_json;
+    const size_t capacity = sizeof(s_weather_json);
+    int used = append_lit(json, capacity, 0, "{\"ok\":true,\"enabled\":");
+    used = append_lit(json, capacity, used, cfg.enabled ? "true" : "false");
+    used = append_lit(json, capacity, used, ",\"lat\":");
+    used = append_coord(json, capacity, used, cfg.lat_e4);
+    used = append_lit(json, capacity, used, ",\"lon\":");
+    used = append_coord(json, capacity, used, cfg.lon_e4);
+    used = append_lit(json, capacity, used, ",\"label\":");
+    used = append_json_name(json, capacity, used, cfg.label);
+    used = append_lit(json, capacity, used, ",\"has_data\":");
+    used = append_lit(json, capacity, used, cache.has_data ? "true" : "false");
+    used = append_lit(json, capacity, used, ",\"code\":");
+    used = append_int_json(json, capacity, used, cache.code);
+    used = append_lit(json, capacity, used, ",\"text\":\"");
+    used = append_lit(json, capacity, used,
+                      cache.has_data ? weather_code_text(cache.code) : "--");
+    used = append_lit(json, capacity, used, "\",\"today_max\":");
+    used = append_int_json(json, capacity, used, cache.today_max);
+    used = append_lit(json, capacity, used, ",\"today_min\":");
+    used = append_int_json(json, capacity, used, cache.today_min);
+    if (cache.has_data) {
+        const int temp = (cache.temp_x10 >= 0)
+                             ? (cache.temp_x10 + 5) / 10
+                             : (cache.temp_x10 - 5) / 10;
+        used = append_lit(json, capacity, used, ",\"temp_c\":");
+        used = append_int_json(json, capacity, used, temp);
+        used = append_lit(json, capacity, used, ",\"temp_x10\":");
+        used = append_int_json(json, capacity, used, cache.temp_x10);
+    }
+    used = append_lit(json, capacity, used, ",\"forecast\":[");
+    bool first = true;
+    for (int i = 0; i < cache.day_count && i < WEATHER_DAY_COUNT; ++i) {
+        if (!cache.days[i].valid) continue;
+        used = append_lit(json, capacity, used, first ? "{" : ",{");
+        first = false;
+        used = append_lit(json, capacity, used, "\"day\":\"");
+        used = append_lit(json, capacity, used, i == 0 ? "TOD" : cache.days[i].weekday);
+        used = append_lit(json, capacity, used, "\",\"weekday\":\"");
+        used = append_lit(json, capacity, used, cache.days[i].weekday);
+        used = append_lit(json, capacity, used, "\",\"code\":");
+        used = append_int_json(json, capacity, used, cache.days[i].code);
+        used = append_lit(json, capacity, used, ",\"text\":\"");
+        used = append_lit(json, capacity, used, weather_code_text(cache.days[i].code));
+        used = append_lit(json, capacity, used, "\",\"max\":");
+        used = append_int_json(json, capacity, used, cache.days[i].max_c);
+        used = append_lit(json, capacity, used, ",\"min\":");
+        used = append_int_json(json, capacity, used, cache.days[i].min_c);
+        used = append_lit(json, capacity, used, "}");
+    }
+    used = append_lit(json, capacity, used, "],\"observed_at\":");
+    used = append_int_json(json, capacity, used, (long)cache.observed_at);
+    used = append_lit(json, capacity, used, ",\"age_s\":");
+    used = append_int_json(json, capacity, used, weather_age_seconds(&cache));
+    used = append_lit(json, capacity, used, ",\"last_error\":");
+    used = append_json_name(json, capacity, used, cache.last_error);
+    used = append_lit(json, capacity, used, ",\"last_error_at\":");
+    used = append_int_json(json, capacity, used, (long)cache.last_error_at);
+    if (used < 0 || (size_t)used + 1 >= capacity) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "weather JSON overflow");
+        return ESP_FAIL;
+    }
+    json[used++] = '}';
+    json[used] = '\0';
+    return send_json(req, json);
+}
+
+static esp_err_t weather_get_handler(httpd_req_t *req)
+{
+    return send_weather_json(req);
+}
+
+static esp_err_t weather_post_handler(httpd_req_t *req)
+{
+    power_mgr_note_activity();
+    char body[256];
+    if (read_json_body(req, body, sizeof(body)) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "body size");
+        return ESP_FAIL;
+    }
+    weather_config_t cfg;
+    (void)weather_config_get(&cfg); /* defaults stay usable if NVS is damaged */
+
+    cJSON *root = cJSON_ParseWithOpts(body, NULL, true);
+    bool valid = cJSON_IsObject(root);
+    const cJSON *lat = cJSON_GetObjectItemCaseSensitive(root, "lat");
+    const cJSON *lon = cJSON_GetObjectItemCaseSensitive(root, "lon");
+    const cJSON *label = cJSON_GetObjectItemCaseSensitive(root, "label");
+    const cJSON *enabled = cJSON_GetObjectItemCaseSensitive(root, "enabled");
+    if (lat) {
+        valid = valid && cJSON_IsNumber(lat) &&
+                lat->valuedouble >= -90.0 && lat->valuedouble <= 90.0;
+        if (valid) cfg.lat_e4 = (int32_t)(lat->valuedouble * 10000.0 +
+                                          (lat->valuedouble >= 0 ? 0.5 : -0.5));
+    }
+    if (lon) {
+        valid = valid && cJSON_IsNumber(lon) &&
+                lon->valuedouble >= -180.0 && lon->valuedouble <= 180.0;
+        if (valid) cfg.lon_e4 = (int32_t)(lon->valuedouble * 10000.0 +
+                                          (lon->valuedouble >= 0 ? 0.5 : -0.5));
+    }
+    if (label) {
+        valid = valid && cJSON_IsString(label) && weather_label_ok(label->valuestring);
+        if (valid) strlcpy(cfg.label, label->valuestring, sizeof(cfg.label));
+    }
+    if (enabled) {
+        valid = valid && cJSON_IsBool(enabled);
+        if (valid) cfg.enabled = cJSON_IsTrue(enabled);
+    }
+    cJSON_Delete(root);
+    if (!valid) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                            "lat -90..90, lon -180..180, label (16 ASCII), enabled");
+        return ESP_FAIL;
+    }
+    const esp_err_t err = weather_config_set(&cfg);
+    if (err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, esp_err_to_name(err));
+        return ESP_FAIL;
+    }
+    return send_weather_json(req);
+}
+
+/* Fetch plus a content redraw, both as one screen job: the radio work and the
+ * 23 s refresh never run inside the HTTP handler. */
+static esp_err_t weather_refresh_post_handler(httpd_req_t *req)
+{
+    power_mgr_note_activity();
+    if (req->content_len != 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "expected empty body");
+        return ESP_FAIL;
+    }
+    if (web_server_screen_busy() || screen_rotation_busy() || !begin_job(JOB_WEATHER)) {
+        httpd_resp_set_status(req, "409 Conflict");
+        return send_json(req, "{\"ok\":false,\"error\":\"screen busy\"}");
+    }
+    set_job_phase(JOB_REFRESH, "weather");
+    xTaskNotifyGive(s_job_task);
+    httpd_resp_set_status(req, "202 Accepted");
+    return send_job_json(req);
+}
+
 /* ---- Partial-window probe API (docs/panel_partial_probe.md) -------------- */
 
 static const char *probe_mode_name(screen_probe_mode_t mode)
@@ -1541,7 +1738,7 @@ esp_err_t web_server_start(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
-    config.max_uri_handlers = 28;
+    config.max_uri_handlers = 32;
     config.stack_size = 12288;
     config.max_open_sockets = 7;
     config.recv_wait_timeout = 5;
@@ -1582,6 +1779,9 @@ esp_err_t web_server_start(void)
         { .uri = "/api/content", .method = HTTP_GET, .handler = content_get_handler },
         { .uri = "/api/content", .method = HTTP_POST, .handler = content_post_handler },
         { .uri = "/api/content/refresh", .method = HTTP_POST, .handler = content_refresh_post_handler },
+        { .uri = "/api/weather", .method = HTTP_GET, .handler = weather_get_handler },
+        { .uri = "/api/weather", .method = HTTP_POST, .handler = weather_post_handler },
+        { .uri = "/api/weather/refresh", .method = HTTP_POST, .handler = weather_refresh_post_handler },
         { .uri = "/api/tf", .method = HTTP_GET, .handler = tf_get_handler },
         { .uri = "/api/tf/import", .method = HTTP_POST, .handler = tf_import_post_handler },
         { .uri = "/api/tf/export", .method = HTTP_POST, .handler = tf_export_post_handler },
