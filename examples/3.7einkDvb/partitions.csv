@@ -1,4 +1,5 @@
-# 4 MiB Flash, factory application plus two disposable image-cache slots.
+# 4 MiB Flash: factory app plus the image cache (3 picture slots of 0x50000
+# and a 4 KiB rotation meta sector at 0xF0000 inside the cache partition).
 # Name,   Type, SubType, Offset,  Size,      Flags
 nvs,      data, nvs,     0x9000,  0x6000,
 phy_init, data, phy,     0xF000,  0x1000,

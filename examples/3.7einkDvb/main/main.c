@@ -4,10 +4,12 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include <stdio.h>
 #include "nfc_driver.h"
 #include "pcf8563.h"
 #include "msa321.h"
 #include "pin_map.h"
+#include "power_mgr.h"
 #include "screen_driver.h"
 #include "screen_ui.h"
 #include "screen_rotation.h"
@@ -55,10 +57,26 @@ static esp_err_t setup_pmic_irq(void)
 
 static void show_network_page(void)
 {
-    char url[48];
+    char url[48], ip[16], strip[24];
     wifi_mgr_service_url(url, sizeof(url));
+    wifi_mgr_get_ip(ip, sizeof(ip));
     screen_rotation_lock();
-    if (screen_rotation_hidden()) { screen_rotation_unlock(); return; }
+    /* A deliberately blanked panel stays blank until the next key press. */
+    if (screen_rotation_hidden()) {
+        screen_rotation_unlock();
+        return;
+    }
+    /* Awake with a picture on the glass: the address strip is the awake marker.
+     * Idle entry replaces the picture and drops the strip again. */
+    if (screen_rotation_has_images()) {
+        snprintf(strip, sizeof(strip), "%s %s", wifi_mgr_is_sta_up() ? "STA" : "AP", ip);
+        screen_rotation_set_overlay(strip);
+        esp_err_t err = screen_rotation_show_image();
+        screen_rotation_unlock();
+        if (err != ESP_OK) ESP_LOGW(TAG, "picture + address: %s", esp_err_to_name(err));
+        return;
+    }
+    screen_rotation_set_overlay(NULL);
     const bool connected = wifi_mgr_is_sta_up();
     ESP_LOGI(TAG, "screen %s  %s", connected ? "LAN QR" : "setup text", url);
     esp_err_t err = connected ? screen_ui_show_link_qr("Scan to upload", url)
@@ -82,7 +100,7 @@ static void screen_task(void *arg)
         xTaskNotifyWait(0, UINT32_MAX, &events, portMAX_DELAY);
         bool pressed = false;
         /* GPIO ISR only notifies; I2C and display work run here, never in the ISR. */
-        if (pwron_err == ESP_OK && (events & SCREEN_EVENT_PMIC_IRQ)) {
+        if (pwron_err == ESP_OK && (events & SCREEN_EVENT_PMIC_IRQ) && !power_mgr_low_power()) {
             esp_err_t err = axp2101_take_pwron_short_press(&pressed);
             if (err != ESP_OK) {
                 ESP_LOGW(TAG, "PWRON read failed: %s", esp_err_to_name(err));
@@ -95,6 +113,7 @@ static void screen_task(void *arg)
             }
         }
         if (pressed) {
+            power_mgr_note_activity();
             /* Preserve the source for the next short press. */
             for (;;) {
                 while (web_server_screen_busy()) vTaskDelay(pdMS_TO_TICKS(25));
@@ -104,9 +123,13 @@ static void screen_task(void *arg)
             }
             esp_err_t err = screen_rotation_toggle_blank();
             bool hidden = screen_rotation_hidden();
+            const bool shows_image = screen_rotation_shows_image();
             screen_rotation_unlock();
             if (err == ESP_OK) {
                 ESP_LOGI(TAG, "PWRON screen %s", hidden ? "white (source retained)" : "image restored");
+                /* Unblanking after a sleep may find no strip stored yet; the
+                 * network page adds it (and is a no-op when already there). */
+                if (!hidden && shows_image) show_network_page();
             } else {
                 ESP_LOGE(TAG, "PWRON toggle failed: %s", esp_err_to_name(err));
             }
@@ -185,4 +208,11 @@ void app_main(void)
     char url[48];
     wifi_mgr_service_url(url, sizeof(url));
     ESP_LOGI(TAG, "HTTP %s", url);
+
+    /* A power key press in low power reopens the network and restores this
+     * page; the same idle timer then closes the AP again after two minutes. */
+    power_mgr_set_wake_cb(on_lan_ready);
+    if (power_mgr_start() != ESP_OK) {
+        ESP_LOGW(TAG, "power manager task; low power disabled");
+    }
 }

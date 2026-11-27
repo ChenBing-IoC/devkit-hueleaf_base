@@ -423,6 +423,7 @@ esp_err_t screen_driver_show_frame(const uint8_t *frame, size_t len)
  * Hash only when upload evidence is requested; boot QR avoids that extra work. */
 static esp_err_t stream_bytes(uint8_t *buffer, size_t capacity, size_t remaining,
                               screen_frame_read_cb_t read_cb, void *context,
+                              screen_frame_decorate_cb_t decorate, void *decorate_ctx,
                               uint32_t *sent_fnv)
 {
     uint32_t hash = 2166136261U;
@@ -435,6 +436,7 @@ static esp_err_t stream_bytes(uint8_t *buffer, size_t capacity, size_t remaining
         if (sent_fnv) {
             for (size_t i = 0; i < received; ++i) hash = (hash ^ buffer[i]) * 16777619U;
         }
+        if (decorate) decorate(decorate_ctx, buffer, sent, received);
         ESP_RETURN_ON_ERROR(write_data(buffer, received), TAG, "stream SPI");
         remaining -= received;
         sent += received;
@@ -463,7 +465,7 @@ static esp_err_t show_otp_stream(const uint8_t *head, size_t head_len,
     if (err == ESP_OK && head_len) err = write_data(head, head_len);
     if (err == ESP_OK) {
         err = stream_bytes(s_spi_tx, sizeof(s_spi_tx), SCREEN_FRAME_BYTES - head_len,
-                           read_cb, context, NULL);
+                           read_cb, context, NULL, NULL, NULL);
     }
     if (err == ESP_OK) err = panel_refresh();
     err = finish_panel_operation(err);
@@ -499,16 +501,19 @@ esp_err_t screen_driver_show_stream_prefaced(const uint8_t *head, size_t head_le
  * before it is committed, so an incomplete/corrupt plane never starts DRF. */
 static esp_err_t upload_plane(uint8_t *buffer, size_t capacity,
                                screen_frame_read_cb_t read_cb, void *context,
+                               screen_frame_decorate_cb_t decorate, void *decorate_ctx,
                                uint32_t *sent_fnv)
 {
     ESP_RETURN_ON_ERROR(write_cmd(0x10), TAG, "upload DTM");
     ESP_RETURN_ON_ERROR(wait_busy(), TAG, "upload DTM busy");
-    return stream_bytes(buffer, capacity, SCREEN_FRAME_BYTES, read_cb, context, sent_fnv);
+    return stream_bytes(buffer, capacity, SCREEN_FRAME_BYTES, read_cb, context,
+                        decorate, decorate_ctx, sent_fnv);
 }
 
 esp_err_t screen_driver_upload(uint32_t expected_generation,
     uint8_t *buffer, size_t capacity, screen_frame_read_cb_t read_cb, void *context,
-    screen_upload_progress_cb_t progress, screen_upload_report_t *report)
+    screen_upload_progress_cb_t progress, screen_frame_decorate_cb_t decorate,
+    void *decorate_ctx, screen_upload_report_t *report)
 {
     if (!s_ctx.inited) return ESP_ERR_INVALID_STATE;
     if (!buffer || !capacity || capacity > EINK_CHUNK_BYTES || !read_cb || !progress || !report)
@@ -523,7 +528,8 @@ esp_err_t screen_driver_upload(uint32_t expected_generation,
     const TickType_t started = xTaskGetTickCount();
     esp_err_t err = panel_six_color_init();
     if (err == ESP_OK) err = progress(context, SCREEN_UPLOAD_RECEIVING);
-    if (err == ESP_OK) err = upload_plane(buffer, capacity, read_cb, context, &report->frame_fnv);
+    if (err == ESP_OK) err = upload_plane(buffer, capacity, read_cb, context,
+                                          decorate, decorate_ctx, &report->frame_fnv);
     const TickType_t stage_started = xTaskGetTickCount();
     if (err == ESP_OK) err = progress(context, SCREEN_UPLOAD_REFRESH);
     if (err == ESP_OK) err = panel_refresh();

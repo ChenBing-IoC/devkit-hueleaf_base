@@ -54,6 +54,8 @@ typedef struct {
     int origin_y;
     const char *title;
     const char *url;
+    /* Message page: lines[0] is the title, lines[1..3] the supporting text. */
+    const char *lines[4];
     size_t sent;
     int last_x;
     uint8_t col[SCREEN_HEIGHT];
@@ -64,6 +66,7 @@ static qr_stream_t s_stream;
 static int ui_width=SCREEN_WIDTH, ui_height=SCREEN_HEIGHT;
 static unsigned ui_rotation;
 static char saved_title[48], saved_url[96];
+static char saved_lines[4][48];
 
 static int font_index(char c)
 {
@@ -79,6 +82,41 @@ static uint8_t glyph_pixel(char c, int gx, int gy)
         return 0;
     }
     return (k_font[font_index(c)][gx] >> gy) & 1;
+}
+
+/* Scale 2 keeps the strip readable on the 3.7" panel (14 px glyphs) while
+ * costing only a bottom band of the picture. */
+#define OVERLAY_SCALE 2
+#define OVERLAY_CELL  ((FONT_W + 1) * OVERLAY_SCALE)
+#define OVERLAY_BAND  (FONT_H * OVERLAY_SCALE + 6)
+
+bool screen_ui_overlay_pixel(const char *text, unsigned rotation, int x, int y, uint8_t *ink)
+{
+    if (!text || !text[0] || !ink) {
+        return false;
+    }
+    int width, height;
+    screen_rotation_size(rotation, &width, &height);
+    if (x < 0 || x >= width || y < height - OVERLAY_BAND || y >= height) {
+        return false;
+    }
+    *ink = SCREEN_COLOR_WHITE;
+    const int len = (int)strlen(text);
+    const int text_width = len * OVERLAY_CELL - OVERLAY_SCALE;
+    const int start_x = (width - text_width) / 2;
+    if (x < start_x || x >= start_x + text_width) {
+        return true;
+    }
+    const int local = x - start_x;
+    const int index = local / OVERLAY_CELL;
+    const int ox = (local % OVERLAY_CELL) / OVERLAY_SCALE;
+    const int top = height - OVERLAY_BAND + 3;
+    const int gy = (y - top) / OVERLAY_SCALE;
+    if (index < len && ox < FONT_W && gy >= 0 && gy < FONT_H &&
+        glyph_pixel(text[index], ox, gy)) {
+        *ink = SCREEN_COLOR_BLACK;
+    }
+    return true;
 }
 
 static void draw_text_row(uint8_t *col, int x, int y, const char *text, int scale)
@@ -123,10 +161,28 @@ static uint8_t pixel_at(const qr_stream_t *s, int x, int y)
     return SCREEN_COLOR_WHITE;
 }
 
+static void paint_message(qr_stream_t *s, int x)
+{
+    if (s->lines[0]) {
+        draw_text_row(s->col, x, ui_height * 30 / 100, s->lines[0], 4);
+    }
+    int y = ui_height * 48 / 100;
+    for (int i = 1; i < 4; i++) {
+        if (s->lines[i] && s->lines[i][0]) {
+            draw_text_row(s->col, x, y, s->lines[i], 2);
+        }
+        y += ui_height * 8 / 100;
+    }
+}
+
 static void paint_column(qr_stream_t *s, int x)
 {
     memset(s->col, SCREEN_COLOR_WHITE, SCREEN_HEIGHT);
     if (s->qr_size == 0) {
+        if (s->lines[0]) {
+            paint_message(s, x);
+            return;
+        }
         draw_text_row(s->col, x, 240, "ready to setup", 4);
         draw_text_row(s->col, x, 340, "WiFi AP OPEN", 4);
         draw_text_row(s->col, x, 400, s->url, 3);
@@ -232,6 +288,29 @@ esp_err_t screen_ui_show_setup(const char *url)
     esp_err_t err = screen_driver_show_stream(qr_read_cb, &s_stream);
 
     if (err == ESP_OK) screen_rotation_note_ui();
+    return err;
+}
+
+esp_err_t screen_ui_show_message(const char *title, const char *line1,
+                                 const char *line2, const char *line3)
+{
+    const char *args[4] = { title, line1, line2, line3 };
+
+    ui_rotation = screen_rotation_get();
+    screen_rotation_size(ui_rotation, &ui_width, &ui_height);
+    memset(&s_stream, 0, sizeof(s_stream));
+    for (int i = 0; i < 4; i++) {
+        snprintf(saved_lines[i], sizeof(saved_lines[i]), "%s", args[i] ? args[i] : "");
+        s_stream.lines[i] = saved_lines[i];
+    }
+    s_stream.last_x = -1;
+    ESP_LOGI(TAG, "message \"%s\"", saved_lines[0]);
+    screen_rotation_note_external();
+    esp_err_t err = screen_driver_show_stream(qr_read_cb, &s_stream);
+
+    /* A notice (low power) is transient: keep the cached pictures so the
+     * device can restore one instead of falling back to the setup page. */
+    if (err == ESP_OK) screen_rotation_note_notice();
     return err;
 }
 

@@ -1,4 +1,4 @@
-/* Six-ink browser dithering and the OTP full-frame transport. */
+/* Six-ink perceptual renderer and the OTP full-frame transport. */
 (function (root, factory) {
   const api = factory();
   if (typeof module === 'object' && module.exports) module.exports = api;
@@ -29,165 +29,178 @@
     const v = i / 255;
     return v <= 0.04045 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4;
   });
+  // OKLab is used for ink selection, error diffusion and tone mapping. sRGB
+  // distances (and even linear-RGB ones) give visibly wrong hues on a six-ink
+  // panel: blue/green mixtures win over the perceptually closer ink, which is
+  // what makes the old renderer look muddy and colour-speckled.
+  function oklabFromLinear(r, g, b) {
+    const l = 0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b;
+    const m = 0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b;
+    const s = 0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b;
+    const l_ = Math.cbrt(l), m_ = Math.cbrt(m), s_ = Math.cbrt(s);
+    return [
+      0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_,
+      1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_,
+      0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_,
+    ];
+  }
   const palette = COLORS.map(c => {
     const rgb = [1, 3, 5].map(i => parseInt(c.css.slice(i, i + 2), 16));
     const lin = rgb.map(v => linear[v]);
-    return { ...c, rgb, lin, luminance: .2126 * lin[0] + .7152 * lin[1] + .0722 * lin[2] };
+    return { ...c, rgb, lin, lab: oklabFromLinear(lin[0], lin[1], lin[2]) };
   });
   const validInk = id => Number.isInteger(id) && (id === 0 || id === 1 || id === 2 || id === 3 || id === 5 || id === 6);
-  const MODES = Object.freeze({ fast: .55, standard: .85, best: 1 });
+  // Diffusion strength. Full strength keeps the mean colour exact; lowering it
+  // trades a little accuracy for a calmer, less noisy texture.
+  const MODES = Object.freeze({ fast: .6, standard: .8, best: .95 });
   const canceledError = () => Object.assign(new Error('预览已更新'), { name: 'AbortError' });
 
-  // Project unrepresentable source colors to the six-ink linear RGB hull.
-  // This removes impossible residuals BEFORE diffusion; representable mixtures
-  // retain full error gain. Coordinates use the same weights as ink selection.
-  function sixInkHull(style) {
-    const w=(style==='illustration'?[1,1,1]:[.3,.5,.2]).map(Math.sqrt);
-    const points=palette.map(c=>c.lin.map((v,i)=>v*w[i])),faces=[];
-    for(let i=0;i<6;i++)for(let j=i+1;j<6;j++)for(let k=j+1;k<6;k++) {
-      const a=points[i],b=points[j],c=points[k],u=b.map((v,n)=>v-a[n]),v=c.map((v,n)=>v-a[n]);
-      let normal=[u[1]*v[2]-u[2]*v[1],u[2]*v[0]-u[0]*v[2],u[0]*v[1]-u[1]*v[0]];
-      const norm=Math.hypot(...normal);if(norm<1e-10)continue;
-      normal=normal.map(v=>v/norm);
-      const sides=points.map(p=>normal.reduce((sum,v,n)=>sum+v*(p[n]-a[n]),0));
-      if(Math.min(...sides)<-1e-8&&Math.max(...sides)>1e-8)continue;
-      if(Math.max(...sides)>1e-8)normal=normal.map(v=>-v);
-      const dot=(a,b)=>a.reduce((sum,v,i)=>sum+v*b[i],0);
-      const uu=dot(u,u),uv=dot(u,v),vv=dot(v,v);
-      const edges=[[a,b],[b,c],[c,a]].map(([a,b])=>{const d=b.map((v,i)=>v-a[i]);return {a,d,n:dot(d,d)};});
-      faces.push({a,u,v,normal,uu,uv,vv,det:uu*vv-uv*uv,edges});
+  function logicalSize(){return panelRotation%180?{width:720,height:480}:{width:480,height:720};}
+
+  // sRGB -> linear light -> OKLab, with alpha composited over paper white.
+  function sourceLab(rgba, width, height) {
+    const lab = new Float32Array(width * height * 3);
+    for (let i = 0, p = 0; i < width * height; i++, p += 4) {
+      const a = rgba[p + 3] / 255;
+      const r = linear[rgba[p]] * a + (1 - a);
+      const g = linear[rgba[p + 1]] * a + (1 - a);
+      const b = linear[rgba[p + 2]] * a + (1 - a);
+      const c = oklabFromLinear(r, g, b);
+      lab[i * 3] = c[0]; lab[i * 3 + 1] = c[1]; lab[i * 3 + 2] = c[2];
     }
-    return {w,faces};
+    return lab;
   }
-  function projectSixColor(r,g,b,hull,out) {
-    const x=r*hull.w[0],y=g*hull.w[1],z=b*hull.w[2];
-    let outside=false;
-    for(const f of hull.faces) {
-      if(f.normal[0]*(x-f.a[0])+f.normal[1]*(y-f.a[1])+f.normal[2]*(z-f.a[2])>1e-8){outside=true;break;}
+
+  // Photographic look: open the shadows a little, roll off clipped highlights
+  // and lift colour. Six inks are less saturated than any camera profile, so a
+  // mild boost is what makes the panel read as a photo instead of a print test.
+  function toneCurve(lab, style) {
+    const photo = style === 'photo';
+    const lift = photo ? .05 : .02;
+    const knee = .88;
+    const sat = photo ? 1.08 : 1.03;
+    const s = photo ? .10 : .04;
+    for (let i = 0; i < lab.length; i += 3) {
+      let l = lab[i];
+      l = l + lift * (1 - l) ** 3;
+      if (l > knee) l = knee + (1 - knee) * (1 - Math.exp(-(l - knee) / (1 - knee)));
+      l = l * (1 - s) + l * l * (3 - 2 * l) * s;
+      lab[i] = clamp(l, 0, 1);
+      lab[i + 1] *= sat;
+      lab[i + 2] *= sat;
     }
-    if(!outside){out[0]=r;out[1]=g;out[2]=b;return;}
-    let distance=Infinity,bx=x,by=y,bz=z;
-    for(const f of hull.faces) {
-      const h=f.normal[0]*(x-f.a[0])+f.normal[1]*(y-f.a[1])+f.normal[2]*(z-f.a[2]);
-      const qx=x-h*f.normal[0],qy=y-h*f.normal[1],qz=z-h*f.normal[2];
-      const tx=qx-f.a[0],ty=qy-f.a[1],tz=qz-f.a[2];
-      const tu=tx*f.u[0]+ty*f.u[1]+tz*f.u[2],tv=tx*f.v[0]+ty*f.v[1]+tz*f.v[2];
-      const s=(tu*f.vv-tv*f.uv)/f.det,t=(tv*f.uu-tu*f.uv)/f.det;
-      if(s>=0&&t>=0&&s+t<=1) {
-        const d=(x-qx)**2+(y-qy)**2+(z-qz)**2;
-        if(d<distance){distance=d;bx=qx;by=qy;bz=qz;}
-      } else for(const e of f.edges) {
-        const u=clamp(((x-e.a[0])*e.d[0]+(y-e.a[1])*e.d[1]+(z-e.a[2])*e.d[2])/e.n,0,1);
-        const qx=e.a[0]+u*e.d[0],qy=e.a[1]+u*e.d[1],qz=e.a[2]+u*e.d[2];
-        const d=(x-qx)**2+(y-qy)**2+(z-qz)**2;
-        if(d<distance){distance=d;bx=qx;by=qy;bz=qz;}
-      }
-    }
-    out[0]=bx/hull.w[0];out[1]=by/hull.w[1];out[2]=bz/hull.w[2];
   }
-  // Source-domain bilateral filter: 3x3, range-weighted, before quantization.
-  // One browser-side RGB row, no frame buffer on the MCU. Do not filter IDs:
-  // removing output dots would destroy the deliberate spatial color mixture.
-  function sixColorRow(rgba, y, row, range) { const {width:WIDTH,height:HEIGHT}=logicalSize();
-    for (let x=0;x<WIDTH;x++) {
-      const center=(y*WIDTH+x)*4;
-      let r=0,g=0,b=0,total=0;
-      for(let dy=-1;dy<=1;dy++) {
-        const yy=y+dy;if(yy<0||yy>=HEIGHT)continue;
-        for(let dx=-1;dx<=1;dx++) {
-          const xx=x+dx;if(xx<0||xx>=WIDTH)continue;
-          const j=(yy*WIDTH+xx)*4;
-          const delta=Math.max(Math.abs(rgba[j]-rgba[center]),Math.abs(rgba[j+1]-rgba[center+1]),
-            Math.abs(rgba[j+2]-rgba[center+2]),Math.abs(rgba[j+3]-rgba[center+3]));
-          const w=range[delta]*(dx===0?2:1)*(dy===0?2:1);
-          if(!w)continue;
-          const a=rgba[j+3]/255;
-          r+=w*(linear[rgba[j]]*a+1-a);g+=w*(linear[rgba[j+1]]*a+1-a);b+=w*(linear[rgba[j+2]]*a+1-a);total+=w;
+
+  // Chroma-only smoothing: photo noise mostly shows up as coloured speckle,
+  // while the eye tolerates blurrier a/b than L. Keeps edges and luma detail.
+  function smoothChroma(lab, width, height, passes) {
+    if (passes <= 0) return lab;
+    const n = width * height, k = [0.25, 0.5, 0.25];
+    let a = new Float32Array(n), b = new Float32Array(n);
+    for (let i = 0; i < n; i++) { a[i] = lab[i * 3 + 1]; b[i] = lab[i * 3 + 2]; }
+    const blur = (src, axis) => {
+      const out = new Float32Array(n);
+      for (let y = 0; y < height; y++) {
+        for (let x = 0; x < width; x++) {
+          let sum = 0, weight = 0;
+          for (let d = -1; d <= 1; d++) {
+            const xx = axis === 0 ? x + d : x, yy = axis === 0 ? y : y + d;
+            if (xx < 0 || xx >= width || yy < 0 || yy >= height) continue;
+            sum += src[yy * width + xx] * k[d + 1]; weight += k[d + 1];
+          }
+          out[y * width + x] = sum / weight;
         }
       }
-      row[x*3]=r/total;row[x*3+1]=g/total;row[x*3+2]=b/total;
-    }
+      return out;
+    };
+    for (let p = 0; p < passes; p++) { a = blur(blur(a, 0), 1); b = blur(blur(b, 0), 1); }
+    for (let i = 0; i < n; i++) { lab[i * 3 + 1] = a[i]; lab[i * 3 + 2] = b[i]; }
+    return lab;
   }
-  // Only two error rows are kept. Full-strength linear-light diffusion preserves
-  // the mean ink coverage for gray, pink and other spatially mixed colors.
-  function logicalSize(){return panelRotation%180?{width:720,height:480}:{width:480,height:720};} function* quantizeSteps(rgba, options = {}) { const {width:WIDTH,height:HEIGHT}=logicalSize();
-    const { gray = false, quality = 'best', style = 'photo', canceled = () => false } = options;
+
+  function nearestInk(cL, cA, cB, inks) {
+    let best = inks[0], distance = Infinity;
+    for (let k = 0; k < inks.length; k++) {
+      const ink = inks[k];
+      const dl = cL - ink.lab[0], da = cA - ink.lab[1], db = cB - ink.lab[2];
+      const d = dl * dl + da * da + db * db;
+      if (d < distance) { distance = d; best = ink; }
+    }
+    return best;
+  }
+
+  // Serpentine Floyd-Steinberg in OKLab. Two error rows are enough; residuals
+  // are clamped so a single out-of-gamut pixel cannot start a colour runaway.
+  function* ditherSteps(lab, options) {
+    const { width: W, height: H } = logicalSize();
+    const { gray = false, quality = 'best', style = 'photo', canceled = () => false,
+      neutralGate = 0 } = options;
     if (!Object.hasOwn(MODES, quality)) throw new Error('未知混色质量');
     if (!['photo', 'illustration', 'flat'].includes(style)) throw new Error('未知呈现风格');
-    if (!rgba || rgba.length !== WIDTH * HEIGHT * 4) throw new Error('裁剪图尺寸必须为 480×720');
-    const denoise = options.denoise ??'off';
-    if (!['off','balanced','strong'].includes(denoise)) throw new Error('未知六色降噪等级');
-    const clean = style !== 'flat' && denoise !== 'off';
-    const strong = denoise === 'strong';
-    const filtered = clean ? new Float32Array(WIDTH*3) : null;
-    const hull = clean && !gray ? sixInkHull(style) : null, projected = clean ? new Float64Array(3) : null;
-    const range = clean ? Float32Array.from({length:256},(_,d)=>d>(strong?48:32)?0:Math.exp(-d*d/(2*(strong?20:12)**2))) : null;
     const inks = gray ? palette.slice(0, 2) : palette;
-    const mono = gray;
-    const gain = style === 'flat' ? 0 : (gray ? 1 : MODES[quality]);
-    const ids = new Uint8Array(WIDTH * HEIGHT);
+    const monoInks = palette.slice(0, 2);
+    const gain = style === 'flat' ? 0 : MODES[quality];
+    const ids = new Uint8Array(W * H);
     const preview = new Uint8ClampedArray(ids.length * 4);
-    let current = gain ? new Float32Array((WIDTH + 2) * 3) : null;
-    let next = gain ? new Float32Array(current.length) : null;
-    for (let y = 0; y < HEIGHT; y++) {
+    let cur = gain ? new Float32Array((W + 2) * 3) : null;
+    let next = gain ? new Float32Array(cur.length) : null;
+    const residualLimit = .5;
+    const clock = typeof performance !== 'undefined' && performance.now ? () => performance.now() : () => Date.now();
+    let sliceStarted = clock();
+    for (let y = 0; y < H; y++) {
       if (canceled()) throw canceledError();
-      if(clean) sixColorRow(rgba,y,filtered,range);
       const dir = y & 1 ? -1 : 1;
-      for (let step = 0; step < WIDTH; step++) {
-        const x = dir === 1 ? step : WIDTH - 1 - step;
-        const i = y * WIDTH + x, e = (x + 1) * 3, src = i * 4;
-        const alpha = rgba[src + 3] / 255;
-        let r = linear[rgba[src]] * alpha + (1 - alpha);
-        let g = linear[rgba[src + 1]] * alpha + (1 - alpha);
-        let b = linear[rgba[src + 2]] * alpha + (1 - alpha);
-        if(clean) {r=filtered[x*3];g=filtered[x*3+1];b=filtered[x*3+2];}
-        // A neutral source must not become a complementary yellow/blue pattern.
-        // Gate by SOURCE color, not error-perturbed color, to avoid oscillation.
-        const encode=v=>255*(v<=.0031308?12.92*v:1.055*v**(1/2.4)-.055);
-        const chroma=clean ? encode(Math.max(r,g,b))-encode(Math.min(r,g,b)) : 0;
-        const neutral=clean && chroma<=(strong?20:12);
-        const pixelMono=mono||neutral;
-        const blend=clean ? clamp((chroma-(strong?20:12))/20,0,1) : 1;
-        const colorGain=blend*blend*(3-2*blend);
-        const neutralBias=clean && !pixelMono ? 1-colorGain : 0;
-        if(hull && !neutral) {projectSixColor(r,g,b,hull,projected);[r,g,b]=projected;}
-        if (gray || neutral) r = g = b = .2126 * r + .7152 * g + .0722 * b;
+      for (let step = 0; step < W; step++) {
+        const x = dir === 1 ? step : W - 1 - step;
+        const i = y * W + x, p = i * 3, e = (x + 1) * 3;
+        // Low-chroma source pixels are printed with black/white only. Mixing
+        // yellow+blue to fake a grey produces the coloured speckle that makes
+        // the old renderer look dirty, especially on skin and overcast skies.
+        const neutral = gray || Math.hypot(lab[p + 1], lab[p + 2]) < neutralGate;
+        let cL = lab[p], cA = lab[p + 1], cB = lab[p + 2];
+        if (gain) { cL += cur[e]; cA += cur[e + 1]; cB += cur[e + 2]; }
+        if (neutral) cA = cB = 0;
+        const ink = nearestInk(cL, cA, cB, neutral ? monoInks : inks);
+        ids[i] = ink.id;
+        preview[i * 4] = ink.rgb[0]; preview[i * 4 + 1] = ink.rgb[1];
+        preview[i * 4 + 2] = ink.rgb[2]; preview[i * 4 + 3] = 255;
         if (gain) {
-          if(pixelMono) {const v=.2126*current[e]+.7152*current[e+1]+.0722*current[e+2];r+=v;g+=v;b+=v;}
-          else {r+=current[e];g+=current[e+1];b+=current[e+2];}
-        }
-        let best = inks[0], distance = Infinity;
-        for (const ink of inks) {
-          if(neutral && ink.id!==0 && ink.id!==1)continue;
-          const dr = r - ink.lin[0], dg = g - ink.lin[1], db = b - ink.lin[2];
-          const d = pixelMono ? (r - ink.luminance) ** 2 :
-            (style === 'illustration' ? dr * dr + dg * dg + db * db :
-              .3 * dr * dr + .5 * dg * dg + .2 * db * db);
-          const score=d+(neutralBias && ink.id!==0 && ink.id!==1 ? .5*neutralBias*neutralBias : 0);
-          if (score < distance) { best = ink; distance = score; }
-        }
-        ids[i] = best.id;
-        preview[src] = best.rgb[0]; preview[src + 1] = best.rgb[1];
-        preview[src + 2] = best.rgb[2]; preview[src + 3] = 255;
-        if (gain) {
-          const luminanceError=.2126*(r-best.lin[0])+.7152*(g-best.lin[1])+.0722*(b-best.lin[2]);
-          for (let c = 0; c < 3; c++) {
-            const value = c === 0 ? r : c === 1 ? g : b;
-            let residual=value-(pixelMono ? best.luminance : best.lin[c]);
-            if(clean && !pixelMono) residual=luminanceError+(residual-luminanceError)*colorGain;
-            const error = clamp(residual, -1, 1) * (pixelMono ? 1 : gain);
-            current[e + dir * 3 + c] += error * 7 / 16;
-            next[e - dir * 3 + c] += error * 3 / 16;
-            next[e + c] += error * 5 / 16;
-            next[e + dir * 3 + c] += error / 16;
-          }
+          const eL = clamp(cL - ink.lab[0], -residualLimit, residualLimit) * gain;
+          const eA = neutral ? 0 : clamp(cA - ink.lab[1], -residualLimit, residualLimit) * gain;
+          const eB = neutral ? 0 : clamp(cB - ink.lab[2], -residualLimit, residualLimit) * gain;
+          cur[e + dir * 3] += eL * 7 / 16; cur[e + dir * 3 + 1] += eA * 7 / 16; cur[e + dir * 3 + 2] += eB * 7 / 16;
+          next[e - dir * 3] += eL * 3 / 16; next[e - dir * 3 + 1] += eA * 3 / 16; next[e - dir * 3 + 2] += eB * 3 / 16;
+          next[e] += eL * 5 / 16; next[e + 1] += eA * 5 / 16; next[e + 2] += eB * 5 / 16;
+          next[e + dir * 3] += eL / 16; next[e + dir * 3 + 1] += eA / 16; next[e + dir * 3 + 2] += eB / 16;
         }
       }
-      if (gain) { [current, next] = [next, current]; next.fill(0); }
-      if ((y & 15) === 15) yield;
+      if (gain) { const swap = cur; cur = next; next = swap; next.fill(0); }
+      if (clock() - sliceStarted > 8) { sliceStarted = clock(); yield; }
     }
     return { ids, preview };
   }
+
+  function* quantizeSteps(rgba, options = {}) {
+    const { width: W, height: H } = logicalSize();
+    const { gray = false, quality = 'best', style = 'photo', canceled = () => false } = options;
+    if (!['photo', 'illustration', 'flat'].includes(style)) throw new Error('未知呈现风格');
+    if (!rgba || rgba.length !== W * H * 4) throw new Error(`裁剪图尺寸必须为 ${W}×${H}`);
+    const denoise = options.denoise ?? 'off';
+    if (!['off', 'balanced', 'strong'].includes(denoise)) throw new Error('未知六色降噪等级');
+    const lab = sourceLab(rgba, W, H);
+    if (style !== 'flat') {
+      toneCurve(lab, style);
+      smoothChroma(lab, W, H, denoise === 'strong' ? 4 : denoise === 'balanced' ? 2 : 0);
+    }
+    const iterator = ditherSteps(lab, { gray, quality, style, canceled,
+      neutralGate: options.neutralGate ?? (style === 'flat' ? .03 : 0) });
+    for (;;) {
+      const step = iterator.next();
+      if (step.done) return step.value;
+      yield;
+    }
+  }
+
   function quantize(rgba, options) {
     const it = quantizeSteps(rgba, options);
     let step;
@@ -272,11 +285,12 @@
       throw err;
     } finally { clearTimeout(timer); }
   }
-  async function sendFrame(frame, onPhase = () => {}) {
+  async function sendFrame(frame, onPhase = () => {}, slot = null) {
     if (!frame || frame.format !== FORMAT || frame.pass !== 0 || !(frame.body instanceof Uint8Array) ||
         frame.body.length !== FRAME_BYTES || !Object.hasOwn(MODES, frame.quality) ||
         checksum(frame.body) !== frame.checksum || (frame.baseGeneration !== undefined &&
-          (!Number.isInteger(frame.baseGeneration) || frame.baseGeneration < 1))) {
+          (!Number.isInteger(frame.baseGeneration) || frame.baseGeneration < 1)) ||
+        (slot !== null && (!Number.isInteger(slot) || slot < 0 || slot > 2))) {
       throw new Error('帧格式或校验值错误');
     }
     onPhase('正在发送六色画面，请等待屏幕完成刷新…');
@@ -284,7 +298,8 @@
       method: 'POST',
       headers: { 'Content-Type': 'application/octet-stream', 'X-Eink-Format': frame.format,
         'X-Eink-Rotation-Epoch': String(frame.rotationEpoch), 'X-Eink-Pass': '0', 'X-Eink-Quality': frame.quality, 'X-Eink-Checksum': frame.checksum,
-        ...(frame.baseGeneration ? {'X-Eink-Base-Generation': String(frame.baseGeneration)} : {}) },
+        ...(frame.baseGeneration ? {'X-Eink-Base-Generation': String(frame.baseGeneration)} : {}),
+        ...(slot === null ? {} : {'X-Eink-Slot': String(slot)}) },
       body: frame.body,
     }, 240000);
     if (!accepted.ok || !Number.isInteger(accepted.id) || accepted.id <= 0) throw new Error('设备协议不匹配，请更新固件并刷新网页');

@@ -1,6 +1,12 @@
 # 本地参考素材，不进仓库
 reference/
 
+# 本地渲染算法实验（对比图、测试照片），不进仓库
+lab/
+
 # ESP-IDF 构建产物
 build/
 sdkconfig.old
+
+# build-watch.ps1 的运行记录
+.esp-build/

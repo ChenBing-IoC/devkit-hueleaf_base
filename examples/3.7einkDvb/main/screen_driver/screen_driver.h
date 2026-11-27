@@ -49,10 +49,17 @@ typedef enum {
 } screen_upload_phase_t;
 /* Return a failure to cancel before the next physical step, never mid-BUSY. */
 typedef esp_err_t (*screen_upload_progress_cb_t)(void *context, screen_upload_phase_t phase);
+/* Runs after the source bytes were hashed for the evidence report and before
+ * they are written to the controller, so a transient overlay (the awake IP
+ * strip) reaches the glass without entering the stored frame or its hash.
+ * offset is the byte offset inside the frame. */
+typedef void (*screen_frame_decorate_cb_t)(void *context, uint8_t *buffer,
+                                           size_t offset, size_t length);
 esp_err_t screen_driver_upload(uint32_t expected_generation,
                                 uint8_t *buffer, size_t capacity,
                                 screen_frame_read_cb_t read_cb, void *context,
                                 screen_upload_progress_cb_t progress,
+                                screen_frame_decorate_cb_t decorate, void *decorate_ctx,
                                 screen_upload_report_t *report);
 /* White fill with the same six-ink OTP waveform as ordinary uploads. */
 esp_err_t screen_driver_clear(screen_upload_report_t *report);

@@ -32,4 +32,12 @@ esp_err_t axp2101_set_charge_config(axp2101_chg_pwr_t pwr, uint16_t capacity);
 uint16_t axp2101_capacity_mah(void);
 uint16_t axp2101_charge_target_ma(axp2101_chg_pwr_t pwr);
 esp_err_t axp2101_gauge_status(bool *enabled, bool *present, int *soc);
+
+/* True while VBUS is present, i.e. a charger/USB cable is attached. */
+bool axp2101_is_usb_connected(void);
+/* Battery percentage 0..100, or -1 when the gauge cannot report it. */
+int axp2101_battery_percent(void);
+/* Soft power off: AXP2101 cuts DCDC/LDO rails and the MCU loses power.
+ * Only VRTC keeps running; the PWRON key powers the board back on. */
+esp_err_t axp2101_power_off(void);
 #endif /* AXP2101_H */

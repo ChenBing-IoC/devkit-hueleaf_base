@@ -107,6 +107,7 @@ The factory firmware is built from this example and supports:
 | Network | Hotspot (AP) provisioning and router (STA) connection; dual-band 2.4 GHz / 5 GHz Wi-Fi 6 |
 | Charging | AXP2101 fuel gauge with battery capacity self-learning; set the battery's rated capacity to adjust charging current at 0.2C / 0.5C / 1C, up to 1000 mA |
 | Power on / off | Hold Power for 0.5 s to power on, 4 s to power off |
+| Low power | Closes the hotspot, turns the radio off and enters light sleep after 2 minutes without network activity; a Power press wakes it and reopens the hotspot; powers itself off after 30 minutes in low power (skipped while USB powered) |
 | TF card | Driver built in; initialization supported |
 | Accelerometer | MSA321 driver built in; initialization and readout supported |
 | RTC | PCF8563 driver built in; initialization, read and write supported |
@@ -140,6 +141,8 @@ idf.py build flash monitor
 5. Once connected, the hotspot turns off and the screen refreshes with a **Scan to upload** QR code.
 
 Wi-Fi credentials are saved on the device and used automatically on next boot. If it can't connect within 12 seconds, the setup hotspot opens again.
+
+The hotspot does not stay open forever: **with no client connected, or 2 minutes after the last web request, it closes and the device enters low power** (see "Low power" below). Press the Power button once to wake it up and reopen the hotspot. While a phone is still associated with the hotspot the device stays awake, and the 2-minute countdown restarts when that phone disconnects.
 
 > [!NOTE]
 > The example hard-codes the Wi-Fi country code to `CN` and runs the setup hotspot on 5 GHz channel 36. If you are in another country or region, change the country code in `examples/3.7einkDvb/main/wifi_mgr/wifi_mgr.c` and `WIFI_AP_CHANNEL` in `wifi_mgr.h` to comply with local radio regulations.
@@ -175,11 +178,35 @@ Images are processed in the browser; only the six-color pixel data is uploaded. 
 | Button | Function |
 | :--- | :--- |
 | Power (hold 0.5 s) | Power on |
-| Power (hold 4 s) | Power off |
-| Power (single press) | Toggle the screen between white and the current picture; the picture is retained |
+| Power (hold 4 s) | Power off (AXP2101 hardware shutdown, works in every state) |
+| Power (single press) | Active: toggle the screen between white and the current picture, the picture is retained. Low power: wake up and reopen the hotspot |
 | BOOT | Rotate the current picture by 90° on each press |
 
 The default orientation is set by `EINK_ROTATION` in `examples/3.7einkDvb/main/pin_map.h` (`0`, `90`, `180` or `270`; default `0`).
+
+#### Low Power
+
+On battery, Wi-Fi and screen refreshes dominate the power budget, so the firmware saves power automatically (see `examples/3.7einkDvb/main/power_mgr/`):
+
+| State | Trigger | Behaviour |
+| :--- | :--- | :--- |
+| Active | A hotspot client is connected, or there was a web request within the last 2 minutes, or the screen is refreshing | Hotspot stays open, web service reachable |
+| Low power | No client connected and no network activity for 2 minutes | Hotspot and radio are turned off, the screen shows **LOW POWER / Press POWER key**, the MCU enters light sleep (a few hundred µA, polling the power key) |
+| Off | 30 minutes in low power with no USB power | AXP2101 software shutdown (same as holding Power for 4 s); hold Power for 0.5 s to power on again |
+
+- Any request (`index.html`, `/api/status` polling, image uploads) restarts the 2-minute countdown; a phone that stays associated keeps the device awake.
+- A single Power press in low power reopens the network: the setup hotspot when no credentials are saved, otherwise the device first tries the configured router. The 2-minute countdown starts again.
+- **An uploaded picture is never overwritten**: while the panel shows picture content, entering low power and waking up leave the panel untouched. Only the firmware pages (setup text / QR code, or a cleared screen) are swapped for **LOW POWER / Press POWER key** and restored to **ready to setup / Scan to upload** after wake-up.
+- The e-paper image is retained in low power and after shutdown; the web page needs a refresh once the hotspot is back.
+- While charging (USB power) the device still closes the hotspot to save power, but the automatic shutdown is skipped.
+
+Tunables live in `examples/3.7einkDvb/main/power_mgr/power_mgr.h`:
+
+| Macro | Default | Meaning |
+| :--- | :--- | :--- |
+| `POWER_IDLE_TIMEOUT_MS` | `2 * 60 * 1000` | Inactivity timeout |
+| `POWER_SLEEP_POLL_MS` | `500` | Power key poll period in low power; smaller is snappier and slightly less efficient |
+| `POWER_AUTO_OFF_MS` | `30 * 60 * 1000` | Automatic shutdown delay in low power; `0` disables it |
 
 ## License
 

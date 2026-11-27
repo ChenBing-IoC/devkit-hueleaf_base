@@ -6,8 +6,13 @@
 #ifndef EINK_ROTATION
 #define EINK_ROTATION 0 /* 0 or 180 degrees 更改此处设置默认屏幕方向 */
 #endif
-#define EINK_ROTATE_BUTTON GPIO_NUM_28
-#define EINK_ROTATE_BUTTON_ACTIVE_LEVEL 0
+/* 左上角按键（低电平按下，内部上拉）。唤醒状态下切换下一张缓存图片，
+ * 并重新开始低功耗计时；不会旋转屏幕。 */
+#define EINK_PICTURE_BUTTON GPIO_NUM_28
+#define EINK_PICTURE_BUTTON_ACTIVE_LEVEL 0
+/* 旧名称，保留给已有代码使用 */
+#define EINK_ROTATE_BUTTON EINK_PICTURE_BUTTON
+#define EINK_ROTATE_BUTTON_ACTIVE_LEVEL EINK_PICTURE_BUTTON_ACTIVE_LEVEL
 #if EINK_ROTATION != 0 && EINK_ROTATION != 90 && EINK_ROTATION != 180 && EINK_ROTATION != 270
 #error "EINK_ROTATION must be 0, 90, 180 or 270"
 #endif

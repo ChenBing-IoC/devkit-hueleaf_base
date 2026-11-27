@@ -17,8 +17,15 @@ typedef enum {
 typedef void (*wifi_mgr_ready_cb_t)(void);
 
 esp_err_t wifi_mgr_start(void);
+/* Low power handshake: suspend() closes the SoftAP and stops the radio while
+ * keeping saved credentials, resume() brings the same network back. */
+esp_err_t wifi_mgr_suspend(void);
+esp_err_t wifi_mgr_resume(void);
 wifi_mgr_mode_t wifi_mgr_mode(void);
 bool wifi_mgr_is_sta_up(void);
+bool wifi_mgr_is_ap_up(void);
+/* Connected SoftAP stations. A non-zero count postpones low power. */
+int wifi_mgr_ap_clients(void);
 esp_err_t wifi_mgr_get_ip(char *buf, size_t len);
 esp_err_t wifi_mgr_get_ssid(char *buf, size_t len);
 esp_err_t wifi_mgr_service_url(char *buf, size_t len);

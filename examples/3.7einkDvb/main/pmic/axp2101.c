@@ -21,6 +21,7 @@ static const char *TAG = "axp2101";
 #define AXP_REG_ADC_CHANNEL      0x30  /* XPOWERS_AXP2101_ADC_CHANNEL_CTRL */
 #define AXP_REG_ADC_VBAT_H       0x34  /* XPOWERS_AXP2101_ADC_DATA_RELUST0 */
 #define AXP_REG_ADC_VBAT_L       0x35  /* XPOWERS_AXP2101_ADC_DATA_RELUST1 */
+#define AXP_REG_COMMON_CONFIG    0x10  /* bit0: software power off */
 #define AXP_REG_INTSTS1          0x48
 #define AXP_REG_INTEN2           0x41
 #define AXP_REG_INTSTS2          0x49
@@ -381,6 +382,36 @@ esp_err_t axp2101_gauge_status(bool *enabled, bool *present, int *soc)
     *present = (st & 8) != 0;
     *soc = (*enabled && *present && pct <= 100) ? pct : -1;
     return ESP_OK;
+}
+
+bool axp2101_is_usb_connected(void)
+{
+    if (!s_inited) return false;
+    uint8_t st = 0;
+    if (axp_read(AXP_REG_STATUS1, &st) != ESP_OK) return false;
+    return (st & (1u << 5)) != 0; /* VBUS good */
+}
+
+int axp2101_battery_percent(void)
+{
+    bool enabled = false, present = false;
+    int soc = -1;
+    if (axp2101_gauge_status(&enabled, &present, &soc) != ESP_OK) return -1;
+    return soc;
+}
+
+esp_err_t axp2101_power_off(void)
+{
+    if (!s_inited) return ESP_ERR_INVALID_STATE;
+    uint8_t config = 0;
+    /* COMMON_CONFIG bit0 = software power off; the write itself cuts the rails. */
+    ESP_RETURN_ON_ERROR(axp_read(AXP_REG_COMMON_CONFIG, &config), TAG, "power off read");
+    esp_err_t err = axp_write(AXP_REG_COMMON_CONFIG, (uint8_t)(config | 0x01));
+    if (err == ESP_OK) {
+        /* Give the PMIC time to finish the rail sequence before the MCU dies. */
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    return err;
 }
 
 axp2101_chg_pwr_t axp2101_get_charge_power(void)

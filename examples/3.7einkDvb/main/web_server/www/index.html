@@ -170,6 +170,8 @@
     .link .dot { width: 7px; height: 7px; background: var(--faint); }
     .link.on { color: var(--ok); border-color: var(--ok); }
     .link.on .dot { background: var(--ok); }
+    .hdr-right { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; flex: 0 0 auto; }
+    .hdr-boot { margin: 0; text-align: right; }
 
     /* ---------- 配色选择 ---------- */
     .picker {
@@ -353,6 +355,39 @@
     .style-card:hover { background: var(--tint); }
     .style-card.active { box-shadow: inset 3px 0 0 var(--accent); background: var(--tint); }
     .style-card:disabled { opacity: 0.45; cursor: not-allowed; }
+
+    .slot-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 8px;
+    }
+    .slot-card {
+      appearance: none;
+      min-width: 0;
+      padding: 8px;
+      border: 1px solid var(--line-2);
+      border-radius: 4px;
+      background: var(--panel);
+      color: var(--ink);
+      text-align: center;
+      cursor: pointer;
+    }
+    .slot-card canvas {
+      display: block;
+      width: 60px;
+      height: 90px;
+      margin: 0 auto 6px;
+      background: repeating-linear-gradient(45deg, #efeee8 0 6px, #e4e3dc 6px 12px);
+      border: 1px solid var(--line-2);
+      border-radius: 2px;
+      image-rendering: pixelated;
+    }
+    .slot-card strong, .slot-card small { display: block; }
+    .slot-card strong { font-size: 0.8rem; font-weight: 600; }
+    .slot-card small { margin-top: 2px; color: var(--faint); font-size: 0.7rem; }
+    .slot-card:hover { background: var(--tint); }
+    .slot-card.active { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); background: var(--tint); }
+    .slot-card:disabled { opacity: 0.5; cursor: not-allowed; }
 
     .swatches {
       display: grid;
@@ -549,8 +584,11 @@
         <h1 class="brand">Eink E6 3.7</h1>
         <div class="spec">{{ panelWidth }}?{{ panelHeight }} ? {{ panelRotation }}?</div>
       </div>
-      <div class="link" :class="{ on: deviceOnline }">
-        <span class="dot"></span>{{ deviceOnline ? '已连接' : '未连接' }}
+      <div class="hdr-right">
+        <div class="link" :class="{ on: deviceOnline }">
+          <span class="dot"></span>{{ deviceOnline ? '已连接' : '未连接' }}
+        </div>
+        <p class="spec hdr-boot" v-if="deviceBootText">{{ deviceBootText }}</p>
       </div>
     </div>
 
@@ -707,6 +745,21 @@
         </div>
         <input type="range" min="18" max="96" step="2" v-model.number="fontSize" @input="renderText" />
       </div>
+    </div>
+
+    <!-- 图片槽位 -->
+    <div v-show="tab === 'image' || tab === 'text'" class="panel" :inert="busy">
+      <div class="field">画面槽位 · 共 3 个，掉电保存</div>
+      <div class="slot-grid">
+        <button v-for="s in slots" :key="'slot-' + s.i" type="button" class="slot-card"
+                :class="{ active: slotTarget === s.i }" :disabled="busy" @click="selectSlot(s.i)">
+          <canvas :ref="el => bindSlotCanvas(el, s.i)" width="60" height="90"
+                  :aria-label="'槽位 ' + (s.i + 1) + ' 预览'"></canvas>
+          <strong>槽位 {{ s.i + 1 }}</strong>
+          <small>{{ s.valid ? (s.i === slotCurrent ? '当前显示' : '已保存') : '空' }}</small>
+        </button>
+      </div>
+      <p class="hint">{{ slotHint }}</p>
     </div>
 
     <!-- 图片 -->
@@ -980,27 +1033,112 @@
         const status = ref('');
         const phase = ref('idle');
         const deviceOnline = ref(false);
+        const deviceUptimeMs = ref(0), deviceReset = ref(''), lastJobError = ref(-1);
+        const resetNames = {
+          poweron: '上电', sw: '软复位', panic: '崩溃重启', task_wdt: '任务看门狗',
+          int_wdt: '中断看门狗', wdt: '看门狗', brownout: '欠压重启',
+          deepsleep: '深睡唤醒', ext: '外部复位',
+        };
+        const deviceBootText = computed(() => {
+          if (!deviceOnline.value || !deviceUptimeMs.value) return '';
+          const total = Math.floor(deviceUptimeMs.value / 1000);
+          const up = total < 60 ? `${total} 秒`
+            : total < 3600 ? `${Math.floor(total / 60)} 分 ${total % 60} 秒`
+            : `${Math.floor(total / 3600)} 时 ${Math.floor(total / 60) % 60} 分`;
+          const why = resetNames[deviceReset.value];
+          return why ? `运行 ${up} · ${why}` : `运行 ${up}`;
+        });
         const quant = ref('color');
         const lastPanelFrame = ref(null), regionUpdate = ref(false), forceRefresh = ref(false);
         const updateRect = ref({x:0, y:0, width:PANEL_W, height:PANEL_H});
         const canRegionUpdate = computed(() => !!lastPanelFrame.value);
+        /* Three persisted picture slots live in the device image cache; the
+         * idle entry cycles through them and an upload may target any one. */
+        const slots = ref([0, 1, 2].map(i => ({ i, valid: false, rotation: 0 })));
+        const slotCurrent = ref(-1);
+        const slotTarget = ref(0);
+        const slotTouched = ref(false);
+        const slotCanvases = [null, null, null];
+        const slotImages = [null, null, null];
+        const slotHint = computed(() => {
+          const s = slots.value[slotTarget.value];
+          if (!s) return '';
+          return s.valid
+            ? `发送后覆盖槽位 ${s.i + 1}；每次进入低功耗自动换成下一张。`
+            : `槽位 ${s.i + 1} 为空，发送后写入。`;
+        });
+        const paintSlot = (i) => {
+          const c = slotCanvases[i];
+          if (!c) return;
+          const ctx = c.getContext('2d');
+          if (slotImages[i]) ctx.putImageData(slotImages[i], 0, 0);
+          else ctx.clearRect(0, 0, 60, 90);
+        };
+        const bindSlotCanvas = (el, i) => {
+          slotCanvases[i] = el;
+          paintSlot(i);
+        };
+        const selectSlot = (i) => {
+          if (busy.value) return;
+          slotTouched.value = true;
+          slotTarget.value = i;
+        };
+        const applySlotList = (info) => {
+          slotCurrent.value = Number.isInteger(info.current) ? info.current : -1;
+          if (Array.isArray(info.slots)) {
+            slots.value = info.slots.map((s, i) => ({
+              i: Number.isInteger(s.i) ? s.i : i, valid: !!s.valid, rotation: s.rotation || 0,
+            }));
+          }
+          if (!slotTouched.value) {
+            const empty = slots.value.find(s => !s.valid);
+            slotTarget.value = empty ? empty.i : (slotCurrent.value + 1) % 3;
+          }
+        };
+        let slotFetchInFlight = false;
+        const refreshSlots = async () => {
+          if (slotFetchInFlight) return;
+          slotFetchInFlight = true;
+          try {
+            const info = await fetchJson('/api/slots', { cache: 'no-store' }, 8000);
+            if (!info.ok) return;
+            applySlotList(info);
+            await Promise.all(slots.value.map(async (s) => {
+              slotImages[s.i] = null;
+              if (s.valid) {
+                try {
+                  const res = await fetch('/api/slot?i=' + s.i, { cache: 'no-store' });
+                  const buf = res.ok ? new Uint8Array(await res.arrayBuffer()) : null;
+                  if (buf && buf.length === 60 * 90 * 4) {
+                    slotImages[s.i] = new ImageData(new Uint8ClampedArray(buf), 60, 90);
+                  }
+                } catch (_) { /* keep the empty frame */ }
+              }
+              paintSlot(s.i);
+            }));
+          } catch (_) {
+            /* device asleep or busy: keep the current thumbnails */
+          } finally {
+            slotFetchInFlight = false;
+          }
+        };
         const ditherQuality = ref('best');
         const ditherModes = [
-          { id: 'fast', name: '轻度', note: '轻度扩散' },
-          { id: 'standard', name: '标准', note: '标准扩散' },
-          { id: 'best', name: '精细', note: '完整扩散 · 保留层次' },
+          { id: 'fast', name: '轻度', note: '扩散较轻 · 颗粒更细' },
+          { id: 'standard', name: '标准', note: '标准扩散 · 平衡' },
+          { id: 'best', name: '精细', note: '完整扩散 · 层次最准' },
         ];
         const previewPixels=ref(false), noisePreviews=ref({}), noisePreviewBusy=ref(false), noiseCompareOpen=ref(false);
         const sixDenoise = ref('balanced');
         const sixDenoiseModes = [
-          {id:'off',name:'关闭',note:'保留原始六色抖动'},
-          {id:'balanced',name:'标准降噪',note:'保护灰色 · 平滑细碎杂点'},
-          {id:'strong',name:'较强降噪',note:'减少暗部杂色 · 弱色彩会变淡'},
+          {id:'off',name:'关闭',note:'不额外平滑 · 保留原图彩噪'},
+          {id:'balanced',name:'标准降噪',note:'平滑彩噪 · 保留明暗细节'},
+          {id:'strong',name:'较强降噪',note:'更强彩噪平滑 · 细节略柔'},
         ];
-        const renderStyle = ref('illustration');
+        const renderStyle = ref('photo');
         const renderStyles = [
-          { id: 'photo', name: '柔和照片', note: '平滑明暗' },
-          { id: 'illustration', name: '清晰插画', note: '保留色彩细节' },
+          { id: 'photo', name: '柔和照片', note: '自然明暗 · 摄影暖调' },
+          { id: 'illustration', name: '清晰插画', note: '保留原色 · 细节优先' },
           { id: 'flat', name: '纯色图形', note: '适合图标与文字 · 六色直取' },
         ];
         const imageName = ref('');
@@ -1429,7 +1567,7 @@
               await Pipeline.verifyBaseline(baseline);
               frame.baseGeneration = baseline.generation;
             }
-            if (!forceRefresh.value && baseline &&
+            if (!forceRefresh.value && baseline && slotTarget.value === slotCurrent.value &&
                 ids.every((id,i) => id === baseline.ids[i])) {
               try {
                 await Pipeline.verifyBaseline(baseline);
@@ -1440,11 +1578,15 @@
               }
             }
             phase.value = 'refresh';
-            const report = await Pipeline.sendFrame(frame, message => { status.value = message; });
+            const report = await Pipeline.sendFrame(frame, message => { status.value = message; },
+              slotTarget.value);
             lastPanelFrame.value = Number.isInteger(report?.display_generation) && report.display_generation > 0
               ? {id:report.id, generation:report.display_generation, ids} : null;
+            slotCurrent.value = slotTarget.value;
+            slotTouched.value = false;
             phase.value = 'done';
-            status.value = '已刷新到屏幕';
+            status.value = `已刷新到屏幕 · 槽位 ${slotTarget.value + 1}`;
+            refreshSlots();
           } catch (e) {
             lastPanelFrame.value = null;
             regionUpdate.value = false;
@@ -1527,6 +1669,7 @@
         };
 
         let statusInFlight = false;
+        let slotSignature = '';
         const checkDevice = async () => {
           if (statusInFlight || busy.value) return;
           statusInFlight = true;
@@ -1536,6 +1679,14 @@
             if (info.mode) wifiMode.value = info.mode;
             if (info.ssid) wifiSsid.value = info.ssid;
             if (info.url) wifiUrl.value = info.url;
+            deviceUptimeMs.value = Number.isFinite(info.uptime_ms) ? info.uptime_ms : 0;
+            deviceReset.value = info.reset_reason || '';
+            // A failed frame job is otherwise lost when the HTTP reply was cut.
+            if (info.job === 'error' && info.job_id !== lastJobError.value && !busy.value) {
+              lastJobError.value = info.job_id;
+              phase.value = 'error';
+              status.value = `设备刷新失败 err=${info.job_err ?? '?'}`;
+            }
             if (deviceOnline.value && !info.rotation_busy) {
  const rotation=info.rotation??0,w=rotation%180?720:480,h=rotation%180?480:720;
  Pipeline.setPanelRotation(rotation,info.rotation_epoch??1);
@@ -1547,6 +1698,12 @@
  }
  }
             if (info.charge && !chargeBusy.value) applyChargeInfo(info);
+            /* Slot content changes on uploads and each low power entry. */
+            const sig = `${info.images ?? ''}/${info.current ?? ''}`;
+            if (deviceOnline.value && sig !== slotSignature) {
+              slotSignature = sig;
+              refreshSlots();
+            }
           } catch (_) {
             deviceOnline.value = false;
           } finally {
@@ -1626,6 +1783,7 @@
           restoreTheme();
           renderText();
           checkDevice();
+          refreshSlots();
           setInterval(() => { if (!document.hidden) checkDevice(); }, 1000);
           document.addEventListener('visibilitychange', () => { if (!document.hidden) checkDevice(); });
           const frame = canvas.value && canvas.value.parentElement;
@@ -1640,13 +1798,14 @@
           panelWidth, panelHeight, panelRotation, tab, text, bg, fg, fontSize, busy, busyLabel, status, statusClass, colors,
           canvas, appearanceCanvas, fileInput, imageName, imageEl, imgW, imgH, quant, dragging,
           previewPixels, noisePreviews, noisePreviewBusy, ditherQuality, ditherModes, sixDenoise, sixDenoiseModes, setSixDenoise, onNoiseCompareToggle,
-          deviceOnline, renderStyle, renderStyles, previewBusy, usedColors, draggingFile,
+          deviceOnline, deviceBootText, renderStyle, renderStyles, previewBusy, usedColors, draggingFile,
           zoom, panX, panY, exposure, brightness, contrast, highlights, shadows, saturation,
           wifiMode, wifiSsid, wifiUrl, wifiList, selectedSsid, wifiPass, wifiBusy, wifiStatus, wifiStatusClass,
           chargeCapacity, chargeDirty, chargeReady, chargeDetail, gaugeDetail, chargePower, chargeBusy, chargeStatus, chargeStatusClass, chargeLevels,
           switchTab, renderText, onFileChange, onDrop, push, setQuant, setDitherQuality, setRenderStyle,
           clearDisplay,
           lastPanelFrame, regionUpdate, forceRefresh, updateRect, canRegionUpdate, setRegionUpdate,
+          slots, slotCurrent, slotTarget, slotHint, selectSlot, bindSlotCanvas,
           onCropChange, onAdjustChange, resetCrop, resetAdjust, rotateImage, imageRotation,
           onPanStart, onPanMove, onPanEnd, scanWifi, selectWifi, connectWifi, setChargePower,
           themes, theme, themeName, setTheme,

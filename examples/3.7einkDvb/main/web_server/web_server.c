@@ -1,6 +1,7 @@
 #include "cJSON.h"
 #include "web_server.h"
 #include "pin_map.h"
+#include "power_mgr.h"
 #include "screen_rotation.h"
 
 #include <stdio.h>
@@ -13,9 +14,12 @@
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_system.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "screen_driver.h"
+#include "screen_ui.h"
 #include "wifi_mgr.h"
 #include "lwip/sockets.h"
 
@@ -25,6 +29,10 @@ typedef enum { JOB_IDLE, JOB_REFRESH, JOB_RECEIVING, JOB_ERROR } job_phase_t;
 typedef enum { JOB_FRAME, JOB_CLEAR_SCREEN } job_kind_t;
 #define FRAME_FORMAT "otp6-v1"
 #define FRAME_CHUNK_BYTES 2048
+#define SLOT_COUNT 3
+#define THUMB_WIDTH 60
+#define THUMB_HEIGHT 90
+#define THUMB_BYTES (THUMB_WIDTH * THUMB_HEIGHT * 4)
 
 static portMUX_TYPE s_job_lock = portMUX_INITIALIZER_UNLOCKED;
 static volatile job_phase_t s_job_phase = JOB_IDLE;
@@ -41,6 +49,7 @@ typedef struct {
     TickType_t started;
     uint32_t hash, expected;
     uint32_t id, base_generation, rotation_epoch;
+    int slot;                              /* -1 = the next slot in the cycle */
 } frame_rx_t;
 static frame_rx_t s_pending;
 
@@ -160,6 +169,8 @@ static esp_err_t send_embedded(httpd_req_t *req, const uint8_t *start, const uin
 
 static esp_err_t send_json(httpd_req_t *req, const char *json)
 {
+    /* Every API reply is a sign of life: it postpones the low power countdown. */
+    power_mgr_note_activity();
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     const esp_err_t err = httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
@@ -172,6 +183,7 @@ static esp_err_t send_json(httpd_req_t *req, const char *json)
 
 static esp_err_t root_get_handler(httpd_req_t *req)
 {
+    power_mgr_note_activity();
     return send_embedded(req, index_html_start, index_html_end, "text/html; charset=utf-8", "no-cache");
 }
 
@@ -211,13 +223,32 @@ static void escape_ssid(const char *src, char *dst)
 
 static size_t append_charge_json(char *json, size_t capacity, size_t used);
 
+/* Lets the page distinguish a light-sleep wake (uptime keeps running) from a
+ * power cycle or panic (uptime restarts, reset_reason names the cause). */
+static const char *reset_reason_name(esp_reset_reason_t reason)
+{
+    switch (reason) {
+    case ESP_RST_POWERON: return "poweron";
+    case ESP_RST_EXT: return "ext";
+    case ESP_RST_SW: return "sw";
+    case ESP_RST_PANIC: return "panic";
+    case ESP_RST_INT_WDT: return "int_wdt";
+    case ESP_RST_TASK_WDT: return "task_wdt";
+    case ESP_RST_WDT: return "wdt";
+    case ESP_RST_DEEPSLEEP: return "deepsleep";
+    case ESP_RST_BROWNOUT: return "brownout";
+    case ESP_RST_SDIO: return "sdio";
+    default: return "unknown";
+    }
+}
+
 static esp_err_t status_get_handler(httpd_req_t *req)
 {
     char ip[16] = { 0 };
     char ssid[33] = { 0 };
     char escaped_ssid[193];
     char url[48] = { 0 };
-    char json[768];
+    char json[1024];
     wifi_mgr_get_ip(ip, sizeof(ip));
     wifi_mgr_get_ssid(ssid, sizeof(ssid));
     wifi_mgr_service_url(url, sizeof(url));
@@ -228,10 +259,16 @@ static esp_err_t status_get_handler(httpd_req_t *req)
         wifi_mgr_is_sta_up() ? "sta" : "ap", ip, escaped_ssid, url);
     if (n < 0 || (size_t)n >= sizeof(json)) return ESP_FAIL;
     size_t used = append_charge_json(json, sizeof(json), (size_t)n);
-    if (used + 48 >= sizeof(json)) return ESP_FAIL;
+    if (used + 160 >= sizeof(json)) return ESP_FAIL;
     int tail = snprintf(json + used, sizeof(json) - used,
-        ",\"job\":\"%s\",\"job_id\":%u,\"rotation\":%u,\"rotation_epoch\":%u,\"rotation_busy\":%s}",
-        job_phase_name(s_job_phase), (unsigned)s_job_id, screen_rotation_get(), (unsigned)screen_rotation_epoch(), screen_rotation_busy() ? "true" : "false");
+        ",\"images\":%u,\"slots\":%d,\"current\":%d,"
+        "\"job\":\"%s\",\"job_id\":%u,\"job_err\":%d,\"rotation\":%u,\"rotation_epoch\":%u,"
+        "\"rotation_busy\":%s,\"uptime_ms\":%llu,\"reset_reason\":\"%s\"}",
+        screen_rotation_image_count(), SLOT_COUNT, screen_rotation_current(),
+        job_phase_name(s_job_phase), (unsigned)s_job_id, (int)s_job_err, screen_rotation_get(),
+        (unsigned)screen_rotation_epoch(), screen_rotation_busy() ? "true" : "false",
+        (unsigned long long)(esp_timer_get_time() / 1000),
+        reset_reason_name(esp_reset_reason()));
     if (tail < 0 || (size_t)tail >= sizeof(json) - used) return ESP_FAIL;
     return send_json(req, json);
 }
@@ -415,6 +452,29 @@ static esp_err_t upload_progress(void *context, screen_upload_phase_t phase)
     return ESP_OK;
 }
 
+/* Draws the awake IP strip over the bytes on their way to the controller. The
+ * stored copy and the hash evidence keep the clean frame, so the low power
+ * replay shows the picture alone. Runs with the rotation lock held. */
+static void ip_strip_decorate(void *context, uint8_t *buffer, size_t offset, size_t length)
+{
+    (void)context;
+    const char *text = screen_rotation_overlay();
+    if (!text[0] || !length) return;
+    const unsigned rotation = screen_rotation_get();
+    for (size_t i = 0; i < length; ++i) {
+        const size_t pos = offset + i;
+        const int px = SCREEN_WIDTH - 1 - (int)(pos / (SCREEN_HEIGHT / 2));
+        uint8_t hi = buffer[i] >> 4, lo = buffer[i] & 15, ink;
+        int x, y;
+        int py = (int)(pos % (SCREEN_HEIGHT / 2)) * 2;
+        screen_rotation_source_xy(rotation, px, py, &x, &y);
+        if (screen_ui_overlay_pixel(text, rotation, x, y, &ink)) hi = ink;
+        screen_rotation_source_xy(rotation, px, py + 1, &x, &y);
+        if (screen_ui_overlay_pixel(text, rotation, x, y, &ink)) lo = ink;
+        buffer[i] = (uint8_t)((hi << 4) | lo);
+    }
+}
+
 static void frame_job_task(void *arg)
 {
     (void)arg;
@@ -427,11 +487,12 @@ static void frame_job_task(void *arg)
         screen_rotation_lock();
         if (kind == JOB_FRAME) {
             const uint8_t blank[3] = {1,1,1};
-            (void)screen_rotation_capture_begin(SCREEN_CACHE_OTP6, blank);
+            (void)screen_rotation_capture_begin(SCREEN_CACHE_OTP6, blank, rx.slot);
             uint8_t *buffer = malloc(FRAME_CHUNK_BYTES);
             err = !screen_rotation_matches(rx.rotation_epoch) ? ESP_ERR_INVALID_STATE :
                 !buffer ? ESP_ERR_NO_MEM : screen_driver_upload(rx.base_generation,
-                buffer, FRAME_CHUNK_BYTES, receive_frame_chunk, &rx, upload_progress, &report);
+                buffer, FRAME_CHUNK_BYTES, receive_frame_chunk, &rx, upload_progress,
+                ip_strip_decorate, NULL, &report);
             free(buffer);
             screen_rotation_capture_end(err == ESP_OK, report.display_generation);
             ESP_LOGI(TAG, "frame id=%u end %s bytes=%u",
@@ -492,7 +553,8 @@ static bool decimal_header(httpd_req_t *req, const char *key, uint32_t *out)
 static esp_err_t frame_post_handler(httpd_req_t *req)
 {
     char format[16], pass[8], quality[12];
-    frame_rx_t rx = { .hash = 2166136261U };
+    frame_rx_t rx = { .hash = 2166136261U, .slot = -1 };
+    power_mgr_note_activity();
     if (httpd_req_get_hdr_value_str(req, "X-Eink-Format", format, sizeof(format)) != ESP_OK ||
         strcmp(format, FRAME_FORMAT) != 0 ||
         httpd_req_get_hdr_value_str(req, "X-Eink-Pass", pass, sizeof(pass)) != ESP_OK ||
@@ -506,6 +568,14 @@ static esp_err_t frame_post_handler(httpd_req_t *req)
     if (req->content_len != SCREEN_FRAME_BYTES) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "expected 172800 bytes");
         return ESP_FAIL;
+    }
+    if (httpd_req_get_hdr_value_len(req, "X-Eink-Slot")) {
+        uint32_t slot = 0;
+        if (!decimal_header(req, "X-Eink-Slot", &slot) || slot >= 3) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "X-Eink-Slot must be 0..2");
+            return ESP_FAIL;
+        }
+        rx.slot = (int)slot;
     }
     if (httpd_req_get_hdr_value_len(req, "X-Eink-Base-Generation") &&
         (!decimal_header(req, "X-Eink-Base-Generation", &rx.base_generation) ||
@@ -562,11 +632,82 @@ static esp_err_t clear_post_handler(httpd_req_t *req)
     return send_job_json(req);
 }
 
+static uint8_t s_thumb[THUMB_BYTES];
+static SemaphoreHandle_t s_thumb_mutex;
+
+static esp_err_t slots_get_handler(httpd_req_t *req)
+{
+    bool valid[SLOT_COUNT];
+    unsigned rotation[SLOT_COUNT];
+    screen_rotation_lock();
+    const int current = screen_rotation_current();
+    for (int i = 0; i < SLOT_COUNT; ++i) {
+        rotation[i] = 0;
+        valid[i] = screen_rotation_slot_info(i, &rotation[i]);
+    }
+    screen_rotation_unlock();
+
+    char json[192];
+    int n = snprintf(json, sizeof(json), "{\"ok\":true,\"count\":%d,\"current\":%d,\"slots\":[",
+                     SLOT_COUNT, current);
+    if (n < 0 || (size_t)n >= sizeof(json)) return ESP_FAIL;
+    for (int i = 0; i < SLOT_COUNT; ++i) {
+        const int used = snprintf(json + n, sizeof(json) - (size_t)n,
+            "%s{\"i\":%d,\"valid\":%s,\"rotation\":%u}", i ? "," : "",
+            i, valid[i] ? "true" : "false", valid[i] ? rotation[i] : 0U);
+        if (used < 0 || (size_t)used >= sizeof(json) - (size_t)n) return ESP_FAIL;
+        n += used;
+    }
+    if ((size_t)n >= sizeof(json) - 3) return ESP_FAIL;
+    json[n++] = ']';
+    json[n++] = '}';
+    json[n] = 0;
+    return send_json(req, json);
+}
+
+/* Raw RGBA thumbnail (60x90) of one stored slot; the page paints it into a
+ * canvas. Empty (removed or never written) slots answer 404. */
+static esp_err_t slot_get_handler(httpd_req_t *req)
+{
+    char query[24], value[8];
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK ||
+        httpd_query_key_value(query, "i", value, sizeof(value)) != ESP_OK || !value[0] ||
+        strspn(value, "0123456789") != strlen(value)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "index ?i=0..2");
+        return ESP_FAIL;
+    }
+    const uint32_t index = (uint32_t)strtoul(value, NULL, 10);
+    if (index >= SLOT_COUNT) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "index ?i=0..2");
+        return ESP_FAIL;
+    }
+    power_mgr_note_activity();
+    if (screen_rotation_busy()) {
+        httpd_resp_set_status(req, "409 Conflict");
+        return send_json(req, "{\"ok\":false,\"error\":\"screen busy\"}");
+    }
+    if (s_thumb_mutex) xSemaphoreTake(s_thumb_mutex, pdMS_TO_TICKS(4000));
+    screen_rotation_lock();
+    const esp_err_t err = screen_rotation_preview((int)index, s_thumb, THUMB_WIDTH, THUMB_HEIGHT);
+    screen_rotation_unlock();
+    if (err != ESP_OK) {
+        if (s_thumb_mutex) xSemaphoreGive(s_thumb_mutex);
+        httpd_resp_send_err(req, err == ESP_ERR_INVALID_STATE ? HTTPD_404_NOT_FOUND :
+                            HTTPD_500_INTERNAL_SERVER_ERROR, esp_err_to_name(err));
+        return ESP_FAIL;
+    }
+    httpd_resp_set_type(req, "application/octet-stream");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    const esp_err_t sent = httpd_resp_send(req, (const char *)s_thumb, THUMB_BYTES);
+    if (s_thumb_mutex) xSemaphoreGive(s_thumb_mutex);
+    return sent;
+}
+
 esp_err_t web_server_start(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
-    config.max_uri_handlers = 12;
+    config.max_uri_handlers = 14;
     config.stack_size = 12288;
     config.max_open_sockets = 7;
     config.recv_wait_timeout = 5;
@@ -597,7 +738,10 @@ esp_err_t web_server_start(void)
         { .uri = "/api/job", .method = HTTP_GET, .handler = job_get_handler },
         { .uri = "/api/panel", .method = HTTP_GET, .handler = panel_get_handler },
         { .uri = "/api/clear", .method = HTTP_POST, .handler = clear_post_handler },
+        { .uri = "/api/slots", .method = HTTP_GET, .handler = slots_get_handler },
+        { .uri = "/api/slot", .method = HTTP_GET, .handler = slot_get_handler },
     };
+    if (s_thumb_mutex == NULL) s_thumb_mutex = xSemaphoreCreateMutex();
     for (size_t i = 0; i < sizeof(handlers) / sizeof(handlers[0]); i++) {
         ESP_RETURN_ON_ERROR(httpd_register_uri_handler(server, &handlers[i]), TAG, "register URI");
     }

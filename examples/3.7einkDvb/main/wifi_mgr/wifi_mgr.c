@@ -30,6 +30,8 @@ static esp_netif_t *s_sta_netif;
 static wifi_mgr_ready_cb_t s_ready_cb;
 static volatile bool s_sta_up;
 static volatile bool s_ap_up;
+static volatile bool s_suspended;
+static volatile int s_ap_clients;
 static char s_sta_ip[16];
 static char s_ssid[33];
 static char s_pass[65];
@@ -162,6 +164,7 @@ static esp_err_t start_apsta(void)
     apply_radio();
     (void)config_ap();
     s_ap_up = true;
+    s_ap_clients = 0;
     ESP_LOGI(TAG, "provision AP \"%s\"  open  %s", WIFI_AP_SSID, WIFI_AP_URL);
     return ESP_OK;
 }
@@ -173,6 +176,7 @@ static void stop_ap_keep_sta(void)
     }
     (void)esp_wifi_set_mode(WIFI_MODE_STA);
     s_ap_up = false;
+    s_ap_clients = 0;
     ESP_LOGI(TAG, "SoftAP off, STA only");
 }
 
@@ -181,6 +185,7 @@ static void on_got_ip(const char *ip)
     lock();
     strncpy(s_sta_ip, ip, sizeof(s_sta_ip) - 1);
     s_sta_up = true;
+    s_ap_clients = 0;
     s_retry = 0;
     unlock();
     save_creds(s_ssid, s_pass);
@@ -202,6 +207,9 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
             (void)esp_wifi_connect();
         }
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        if (s_suspended) {
+            return;
+        }
         s_sta_up = false;
         s_sta_ip[0] = 0;
         if (s_ssid[0] && s_retry < 6) {
@@ -213,13 +221,53 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
         }
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_AP_STACONNECTED) {
         wifi_event_ap_staconnected_t *e = data;
-        ESP_LOGI(TAG, "phone " MACSTR " joined AP", MAC2STR(e->mac));
+        lock();
+        if (s_ap_clients < 8) s_ap_clients++;
+        const int clients = s_ap_clients;
+        unlock();
+        ESP_LOGI(TAG, "phone " MACSTR " joined AP, clients=%d", MAC2STR(e->mac), clients);
+    } else if (base == WIFI_EVENT && id == WIFI_EVENT_AP_STADISCONNECTED) {
+        wifi_event_ap_stadisconnected_t *e = data;
+        lock();
+        if (s_ap_clients > 0) s_ap_clients--;
+        const int clients = s_ap_clients;
+        unlock();
+        ESP_LOGI(TAG, "phone " MACSTR " left AP, clients=%d", MAC2STR(e->mac), clients);
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *e = data;
         char ip[16];
         snprintf(ip, sizeof(ip), IPSTR, IP2STR(&e->ip_info.ip));
         on_got_ip(ip);
     }
+}
+
+/* Open Wi-Fi as configured: saved STA first, then the provisioning SoftAP. */
+static esp_err_t begin_network(uint32_t wait_ms)
+{
+    esp_err_t err;
+
+    xEventGroupClearBits(s_events, GOT_IP_BIT | STA_FAIL_BIT);
+    s_retry = 0;
+    if (s_ssid[0]) {
+        ESP_LOGI(TAG, "saved SSID \"%s\", try STA", s_ssid);
+        err = esp_wifi_set_mode(WIFI_MODE_STA);
+        if (err != ESP_OK) return err;
+        err = config_sta(s_ssid, s_pass);
+        if (err != ESP_OK) return err;
+        err = esp_wifi_start();
+        if (err != ESP_OK && err != ESP_ERR_WIFI_CONN) return err;
+        apply_radio();
+        EventBits_t bits = xEventGroupWaitBits(s_events, GOT_IP_BIT | STA_FAIL_BIT,
+                                               pdFALSE, pdFALSE, pdMS_TO_TICKS(wait_ms));
+        if (bits & GOT_IP_BIT) {
+            return ESP_OK;
+        }
+        ESP_LOGW(TAG, "STA timeout, fall back to provision AP");
+        xEventGroupClearBits(s_events, GOT_IP_BIT | STA_FAIL_BIT);
+        s_retry = 0;
+    }
+
+    return start_apsta();
 }
 
 esp_err_t wifi_mgr_start(void)
@@ -252,26 +300,46 @@ esp_err_t wifi_mgr_start(void)
                                                         &wifi_event_handler, NULL, NULL));
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
 
-    if (s_ssid[0]) {
-        ESP_LOGI(TAG, "saved SSID \"%s\", try STA", s_ssid);
-        err = esp_wifi_set_mode(WIFI_MODE_STA);
-        if (err != ESP_OK) return err;
-        err = config_sta(s_ssid, s_pass);
-        if (err != ESP_OK) return err;
-        err = esp_wifi_start();
-        if (err != ESP_OK && err != ESP_ERR_WIFI_CONN) return err;
-        apply_radio();
-        EventBits_t bits = xEventGroupWaitBits(s_events, GOT_IP_BIT | STA_FAIL_BIT,
-                                               pdFALSE, pdFALSE, pdMS_TO_TICKS(BOOT_WAIT_MS));
-        if (bits & GOT_IP_BIT) {
-            return ESP_OK;
-        }
-        ESP_LOGW(TAG, "STA timeout, fall back to provision AP");
-        xEventGroupClearBits(s_events, GOT_IP_BIT | STA_FAIL_BIT);
-        s_retry = 0;
-    }
+    return begin_network(BOOT_WAIT_MS);
+}
 
-    return start_apsta();
+esp_err_t wifi_mgr_suspend(void)
+{
+    lock();
+    s_suspended = true;
+    s_ap_up = false;
+    s_ap_clients = 0;
+    s_sta_up = false;
+    s_sta_ip[0] = 0;
+    unlock();
+
+    /* Closing both interfaces releases the SoftAP and the radio; saved
+     * credentials stay in NVS so resume() can rebuild the same network. */
+    (void)esp_wifi_set_mode(WIFI_MODE_NULL);
+    esp_err_t err = esp_wifi_stop();
+    if (err == ESP_ERR_WIFI_NOT_STARTED || err == ESP_ERR_WIFI_NOT_INIT) {
+        err = ESP_OK;
+    }
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "AP closed, radio off for low power");
+    } else {
+        ESP_LOGW(TAG, "esp_wifi_stop: %s", esp_err_to_name(err));
+    }
+    return err;
+}
+
+esp_err_t wifi_mgr_resume(void)
+{
+    lock();
+    const bool was_suspended = s_suspended;
+    s_suspended = false;
+    s_retry = 0;
+    unlock();
+    if (!was_suspended) {
+        return ESP_OK;
+    }
+    ESP_LOGI(TAG, "resume network after low power");
+    return begin_network(BOOT_WAIT_MS);
 }
 
 wifi_mgr_mode_t wifi_mgr_mode(void)
@@ -282,6 +350,16 @@ wifi_mgr_mode_t wifi_mgr_mode(void)
 bool wifi_mgr_is_sta_up(void)
 {
     return s_sta_up;
+}
+
+bool wifi_mgr_is_ap_up(void)
+{
+    return s_ap_up;
+}
+
+int wifi_mgr_ap_clients(void)
+{
+    return s_ap_clients;
 }
 
 esp_err_t wifi_mgr_get_ip(char *buf, size_t len)

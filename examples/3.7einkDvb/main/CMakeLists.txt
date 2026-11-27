@@ -12,6 +12,7 @@ idf_component_register(
         "qrcode/qrcode.c"
         "tf_card/tf_card.c"
         "wifi_mgr/wifi_mgr.c"
+        "power_mgr/power_mgr.c"
         "web_server/web_server.c"
     INCLUDE_DIRS
         "."
@@ -25,6 +26,7 @@ idf_component_register(
         "qrcode"
         "tf_card"
         "wifi_mgr"
+        "power_mgr"
         "web_server"
     PRIV_REQUIRES
         json
@@ -46,4 +48,7 @@ idf_component_register(
         "web_server/www/index.html"
         "web_server/www/eink_pipeline.js"
         "web_server/www/vue.global.prod.js"
+        "screen_driver/defaults/pic0.bin"
+        "screen_driver/defaults/pic1.bin"
+        "screen_driver/defaults/pic2.bin"
 )
