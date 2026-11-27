@@ -57,7 +57,7 @@ SPI 主机为 SPI2。板级代码将共享总线访问串行化；自行添加 S
 
 | 信号 | GPIO | 说明 |
 | --- | --- | --- |
-| IMU_IRQ | GPIO4 | MSA321 中断网络；当前固件将其配置为输入 |
+| IMU_IRQ | GPIO4 | MSA321 INT1 直连 C5 GPIO4；GPIO4 在 LP 域，可作深睡唤醒源。中断寄存器表待手册核对，当前固件只轮询、不配置该中断 |
 | PMIC_IRQ | GPIO25 | AXP2101 nIRQ，低有效，下降沿通知任务 |
 | RTC_IRQ | GPIO23 | PCF8563 中断网络；当前固件将其配置为输入 |
 | 画面按键 | GPIO28 | 低电平按下，内部上拉；唤醒状态下切换到下一张缓存图片（带 IP 小字），并重新开始 2 分钟 Wi-Fi 计时 |
@@ -118,12 +118,13 @@ SPI 主机为 SPI2。板级代码将共享总线访问串行化；自行添加 S
 
 - 热点客户端数量由 `wifi_mgr` 统计（`WIFI_EVENT_AP_STACONNECTED` / `STADISCONNECTED`），数量大于 0 时 `power_mgr` 持续刷新活动时间戳，因此不会进入低功耗；断开后重新开始计时，符合「AP 有客户端时不休眠」的约定。
 - 唤醒后调用 `wifi_mgr_resume()`：有保存的 STA 凭据时先尝试连接路由器（12 秒），失败则重新打开配网热点；屏幕由 `main.c` 的 `screen_task` 重绘网络页。
-- 唤醒原因在 `app_main` 一开始由 `power_mgr_boot_init()` 分类：`ESP_SLEEP_WAKEUP_TIMER` 走维护会话，`EXT1` / `GPIO` 或上电、复位走交互会话。定时唤醒后第一时间读 AXP2101 短按状态，若睡眠期间按过电源键（事件被 PMIC 锁存）则把本次会话升级为交互唤醒。
-- 深睡唤醒源在启动时用 `esp_sleep_is_valid_wakeup_gpio()` 自检 GPIO25/4/28/23 并打印 `deep wake pins:` 日志。ESP32-C5 只有 LP 域 GPIO（0~6）能做深睡唤醒源；GPIO25 有效时用 `ESP_EXT1_WAKEUP_ALL_LOW` 单脚唤醒，无效时降级为纯定时器唤醒 + 锁存按键升级，`/api/power` 的 `deep_ok` 反映实际能力。
+- 唤醒原因在 `app_main` 一开始由 `power_mgr_boot_init()` 分类：`ESP_SLEEP_WAKEUP_TIMER` 走维护会话；`EXT1`、`GPIO` 或上电、复位走交互会话。`ESP_SLEEP_WAKEUP_GPIO` 且 `esp_sleep_get_gpio_wakeup_status()` 掩码含 GPIO4 时日志记为 `motion wake`，同样按交互会话处理（开 AP、加 IP 小字、重新 2 分钟计时）。定时唤醒后第一时间读 AXP2101 短按状态，若睡眠期间按过电源键（事件被 PMIC 锁存）则把本次会话升级为交互唤醒。
+- 深睡唤醒源在启动时用 `esp_sleep_is_valid_wakeup_gpio()` 自检 GPIO25/4/28/23 并打印 `deep wake pins:` 日志。ESP32-C5 只有 LP 域 GPIO（0~6）能做深睡唤醒源；GPIO25 有效时用 `ESP_EXT1_WAKEUP_ALL_LOW` 单脚唤醒，无效时降级为纯定时器唤醒 + 锁存按键升级，`/api/power` 的 `deep_ok` 反映实际能力。GPIO4（IMU INT1）在中断寄存器表可用时额外用 `esp_deep_sleep_enable_gpio_wakeup()` arm 为高电平唤醒源；不可用或 arm 失败时只保留定时器/电源键，睡眠流程不受影响。
 - 浅睡轮询使用 `esp_light_sleep_start()` + 定时唤醒；深睡则完全断电重启，靠 PCF8563 保时（开机 `pcf8563_restore_system_time()` 只向前调表，SNTP 成功后 `pcf8563_save_system_time()` 写回）。
 - 两种睡眠都在 `power_mgr` 持有 `screen_rotation` 锁、且 `web_server_screen_busy()` / `screen_rotation_busy()` 为假之后才进入，避免 SPI/Flash 任务与睡眠重叠。浅睡会冻结负责喂狗的空闲任务，因此进入低功耗前用 `esp_task_wdt_reconfigure()` 暂停任务看门狗，唤醒后按原配置恢复，避免长睡眠触发 TWDT。
 - 画面底部的白底黑字小字（`AP 192.168.4.1` 或 `STA <ip>`）只在工作状态显示，由驱动在 SPI 发送前临时叠加，不会写入图片缓存；进入低功耗时先清掉小字，再按槽位顺序刷新下一张图片，因此「有无 IP 小字」就是低功耗状态的直观指示，待机画面仍是完整无水印的一张图。屏幕被电源键刷白（清屏）时保持白屏，不参与切换。
 - 三个图片槽位保存在 `image_cache` 分区，掉电不丢；网页上传可指定槽位（`X-Eink-Slot`），页面通过 `/api/slots`、`/api/slot?i=N` 显示三个槽位的缩略图。
+- 加速度计在唤醒状态由 `imu_app` 以约 15 Hz 轮询：Z 轴符号翻转并稳定 300 ms 视为翻面，两次冲击间隔小于 400 ms 视为双击，两者都复用 `screen_rotation_show_next(true)` 换下一张图并重置 2 分钟计时；800 ms 去抖避免走路连翻。`GET /api/imu` 返回最近三轴加速度、朝向、翻面/双击计数和深睡唤醒能力。
 - 固件内置三张 480 × 720 六色示例帧（`main/screen_driver/defaults/pic*.bin`，由 `demo_images/pack_default_frames.py` 从示范 PNG 生成）。`screen_rotation_init()` 发现三个槽位都无效时会把它们写入缓存，因此新机器或旧缓存格式升级后开机即可显示图片而不是配网文字；已有有效图片的设备不会被覆盖。
 - 充电时（`axp2101_is_usb_connected()` 为真）「自动」策略只降功耗到浅睡、不深睡也不自动关机，避免 USB 调试和充电过程中意外断电；「强制深睡」则无视 USB。
 - 自动关机规则随定时唤醒变化：`interval_min > 0` 时不再执行 30 分钟关机（否则定时唤醒会被关掉），只保留电量保护；把唤醒间隔设为 0 才恢复 `POWER_AUTO_OFF_MS` 规则。
@@ -161,7 +162,7 @@ idf.py -p COMx flash monitor
 | TF 卡 | `main/tf_card/` | 与屏幕共用 SPI2；以 FAT 文件系统挂载到 `/sdcard`，不自动格式化卡 |
 | PMIC | `main/pmic/axp2101.c` | 初始化电源管理、读取电池/充电状态和电源键事件 |
 | RTC | `main/rtc/pcf8563.c` | 当前初始化会将 RTC 写为固件编译时间并回读；不是网络校时 |
-| IMU | `main/imu/msa321.c` | 当前以 ±4 g、125 Hz 配置，启动时读取一次加速度样本 |
+| IMU | `main/imu/msa321.c`、`main/imu/imu_app.c` | `msa321.c` 以 ±4 g、125 Hz 配置并提供 any-motion 中断接口（寄存器表待手册核对）；`imu_app.c` 醒着时约 15 Hz 采样，识别翻面/双击换图，经 `/api/imu` 暴露状态，并向 `power_mgr` 提供深睡运动唤醒的 arm/clear |
 
 SoftAP 当前配置为开放网络，仅建议在受控开发环境中使用。开发网页服务时注意该 AP 没有密码保护。
 

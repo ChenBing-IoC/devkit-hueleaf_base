@@ -712,6 +712,10 @@
       <p class="hint">深睡时整机断电，屏上画面保留。定时唤醒只连 STA 校时、记录电量，不刷新屏幕也不加 IP 小字。USB 供电时「自动」策略保持浅睡以便调试；关闭定时唤醒后恢复旧策略：低功耗 30 分钟自动关机，低电量（&lt;5%）也会保护关机。</p>
       <p class="status" :class="powerStatusClass" role="status" aria-live="polite">{{ powerStatus }}</p>
 
+      <div class="field" style="margin-top:18px">加速度计</div>
+      <p class="hint">{{ imuDetail }}</p>
+      <p class="hint">拿起或翻面会切换到下一张缓存图片，双击同样换图；深睡运动唤醒取决于中断是否可用，不可用时仍由定时器或电源键唤醒。</p>
+
     </div>
 
     <div v-show="tab === 'text' || tab === 'image'" class="editor-layout">
@@ -1088,6 +1092,31 @@
             ' · 电量 ' + (info.batt >= 0 ? info.batt + '%' : '未知') +
             ' · ' + wake + ' · 上次唤醒 ' + (info.last_wake || '未知') +
             (stateName ? ' · 当前 ' + stateName : '');
+        };
+        const imuDetail = ref('正在读取加速度计');
+        const applyImuInfo = (info) => {
+          if (!info || !info.ok) { imuDetail.value = '加速度计状态不可用'; return; }
+          if (!info.present) { imuDetail.value = '不可用（未检测到 MSA321）'; return; }
+          const names = { portrait: '竖放', landscape: '横放', faceup: '正面朝上', facedown: '正面朝下', unknown: '未判定' };
+          const num = (v) => Number.isFinite(v) ? v.toFixed(2) : '—';
+          const events = info.events || {};
+          imuDetail.value = '可用 · ' + (names[info.orientation] || info.orientation) +
+            ' · X ' + num(info.x) + 'g / Y ' + num(info.y) + 'g / Z ' + num(info.z) + 'g' +
+            ' · 翻面 ' + (events.flip || 0) + ' 次，双击 ' + (events.tap || 0) + ' 次' +
+            ' · 深睡运动唤醒' + (info.wake_armed ? '可用' : '不可用');
+        };
+        let imuInFlight = false, imuFetchedAt = 0;
+        const refreshImu = async () => {
+          if (imuInFlight) return;
+          imuInFlight = true;
+          try {
+            const info = await fetchJson('/api/imu', { cache: 'no-store' }, 5000);
+            applyImuInfo(info);
+          } catch (_) {
+            imuDetail.value = '加速度计状态离线';
+          }
+          imuFetchedAt = Date.now();
+          imuInFlight = false;
         };
         const text = ref('你好，Eink');
         const bg = ref(0x1);
@@ -1543,6 +1572,7 @@
           clearTimeout(ditherTimer);
           previewBusy.value = false;
           tab.value = t;
+          if (t === 'settings') refreshImu();
           nextTick(() => {
             if (t === 'text') renderText();
             else if (t === 'image' && imageEl.value) scheduleDither();
@@ -1763,6 +1793,8 @@
  }
             if (info.charge && !chargeBusy.value) applyChargeInfo(info);
             if (deviceOnline.value && Date.now() - powerFetchedAt > 5000) refreshPower();
+            if (deviceOnline.value && tab.value === 'settings' &&
+                Date.now() - imuFetchedAt > 5000) refreshImu();
             /* Slot content changes on uploads and each low power entry. */
             const sig = `${info.images ?? ''}/${info.current ?? ''}`;
             if (deviceOnline.value && sig !== slotSignature) {
@@ -1908,7 +1940,7 @@
           zoom, panX, panY, exposure, brightness, contrast, highlights, shadows, saturation,
           wifiMode, wifiSsid, wifiUrl, wifiList, selectedSsid, wifiPass, wifiBusy, wifiStatus, wifiStatusClass,
           chargeCapacity, chargeDirty, chargeReady, chargeDetail, gaugeDetail, chargePower, chargeBusy, chargeStatus, chargeStatusClass, chargeLevels,
-          powerMode, powerInterval, powerDirty, powerReady, powerBusy, powerStatus, powerStatusClass, powerDetail,
+          powerMode, powerInterval, powerDirty, powerReady, powerBusy, powerStatus, powerStatusClass, powerDetail, imuDetail,
           wakeIntervals, sleepModes, savePower,
           switchTab, renderText, onFileChange, onDrop, push, setQuant, setDitherQuality, setRenderStyle,
           clearDisplay,

@@ -11,6 +11,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "imu_app.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "pcf8563.h"
@@ -159,6 +160,17 @@ static void probe_wake_pins(void)
              s_pin25 ? "" : " (power key: timer-only fallback, latched press promotes the wake)");
 }
 
+/* The IMU interrupt only counts as a wake source when the sensor answered,
+ * the register table is compiled in and GPIO4 is in the LP domain. */
+static bool imu_wake_possible(void)
+{
+#if POWER_IMU_WAKE
+    return imu_app_wake_supported();
+#else
+    return false;
+#endif
+}
+
 static void load_config(void)
 {
     nvs_handle_t nvs;
@@ -213,9 +225,19 @@ static bool classify_boot(void)
         s_last_wake = "timer";
         return true;
     case ESP_SLEEP_WAKEUP_EXT1:
-    case ESP_SLEEP_WAKEUP_GPIO:
         s_last_wake = "gpio";
         return false;
+    case ESP_SLEEP_WAKEUP_GPIO: {
+        /* The GPIO wake status is a bit mask; GPIO4 is the accelerometer. */
+        const uint64_t mask = esp_sleep_get_gpio_wakeup_status();
+        if (mask & (1ULL << (int)imu_irq)) {
+            s_last_wake = "motion";
+            ESP_LOGI(TAG, "motion wake on GPIO%d: interactive session", (int)imu_irq);
+        } else {
+            s_last_wake = "gpio";
+        }
+        return false;
+    }
     case ESP_SLEEP_WAKEUP_UNDEFINED:
         s_last_wake = esp_reset_reason() == ESP_RST_POWERON ? "poweron" : "reset";
         return false;
@@ -298,7 +320,7 @@ esp_err_t power_mgr_deep_sleep(void)
     return ESP_ERR_NOT_SUPPORTED;
 #else
     const bool timer = s_cfg.interval_min > 0;
-    if (!timer && !s_pin25) {
+    if (!timer && !s_pin25 && !imu_wake_possible()) {
         /* Nothing would bring the MCU back: stay in the light sleep loop. */
         return ESP_ERR_INVALID_STATE;
     }
@@ -338,6 +360,40 @@ esp_err_t power_mgr_deep_sleep(void)
         }
     }
 
+    bool motion_armed = false;
+    bool fallback_timer = false;
+    if (imu_wake_possible()) {
+        /* imu_app_prepare_wake() clears the latched event before programming
+         * the interrupt: arming a pin that is already high would wake the chip
+         * the moment it sleeps. */
+        if (imu_app_prepare_wake()) {
+            err = esp_deep_sleep_enable_gpio_wakeup(1ULL << (int)imu_irq,
+                                                    ESP_GPIO_WAKEUP_GPIO_HIGH);
+            if (err == ESP_OK) {
+                motion_armed = true;
+            } else {
+                ESP_LOGW(TAG, "motion wake on GPIO%d: %s", (int)imu_irq,
+                         esp_err_to_name(err));
+            }
+        }
+    }
+
+    if (!timer && !s_pin25 && !motion_armed) {
+        /* The policy pre-check allowed a motion-only sleep but the interrupt
+         * could not be armed. Never call esp_deep_sleep_start() without a
+         * source: arm a last-resort timer instead of parking forever. */
+        err = esp_sleep_enable_timer_wakeup((uint64_t)POWER_FALLBACK_WAKE_MIN *
+                                            60ULL * 1000000ULL);
+        if (err != ESP_OK) {
+            screen_rotation_unlock();
+            ESP_LOGE(TAG, "fallback timer wake: %s", esp_err_to_name(err));
+            return err;
+        }
+        fallback_timer = true;
+        ESP_LOGW(TAG, "no wake source armed, fallback timer %u min",
+                 (unsigned)POWER_FALLBACK_WAKE_MIN);
+    }
+
     /* The PCF8563 keeps the wall clock across the power down; the soft clock
      * would restart at zero. */
     esp_err_t rtc_err = pcf8563_save_system_time();
@@ -354,11 +410,14 @@ esp_err_t power_mgr_deep_sleep(void)
 
     s_state = POWER_STATE_LOW_POWER;
     s_low_power = true;
-    if (timer) {
-        ESP_LOGI(TAG, "deep sleep, timer wake in %u min%s", (unsigned)s_cfg.interval_min,
+    ESP_LOGI(TAG, "motion wake %s", motion_armed ? "armed on GPIO4" : "not available");
+    if (timer || fallback_timer) {
+        ESP_LOGI(TAG, "deep sleep, timer wake in %u min%s",
+                 (unsigned)(timer ? s_cfg.interval_min : POWER_FALLBACK_WAKE_MIN),
                  s_pin25 ? ", POWER key armed" : ", POWER key latched (timer-only)");
     } else {
-        ESP_LOGI(TAG, "deep sleep, timer off, POWER key armed");
+        ESP_LOGI(TAG, "deep sleep, timer off, %s",
+                 s_pin25 ? "POWER key armed" : motion_armed ? "motion armed" : "no source");
     }
     esp_deep_sleep_start();
     /* esp_deep_sleep_start() does not return once a wake source is armed. */
@@ -558,7 +617,7 @@ static bool deep_sleep_selected(void)
 #if !POWER_USE_DEEP_SLEEP
     return false;
 #else
-    if (!s_pin25 && s_cfg.interval_min == 0) {
+    if (!s_pin25 && s_cfg.interval_min == 0 && !imu_wake_possible()) {
         return false; /* no wake source at all */
     }
     switch (s_cfg.mode) {
@@ -637,6 +696,7 @@ static void power_task(void *arg)
                                   : "off");
     ESP_LOGI(TAG, "auto power off after %u min only while the timer wake is off (0 = never)",
              (unsigned)(POWER_AUTO_OFF_MS / 60000));
+    ESP_LOGI(TAG, "motion wake %s", imu_wake_possible() ? "available" : "unavailable");
     power_mgr_note_activity();
 
     for (;;) {

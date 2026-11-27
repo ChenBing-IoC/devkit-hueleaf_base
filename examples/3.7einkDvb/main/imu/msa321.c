@@ -33,6 +33,7 @@ static const char *TAG = "imu";
 
 static i2c_master_dev_handle_t s_dev;
 static bool s_inited;
+static bool s_present;
 
 static esp_err_t imu_write_u8(uint8_t reg, uint8_t val)
 {
@@ -102,6 +103,9 @@ esp_err_t msa321_init(void)
     } else {
         ESP_LOGI(TAG, "MSA321 PARTID=0x%02X", partid);
     }
+    /* Something answered at 0x62: keep the sensor usable even when the part
+     * ID differs (clone or future revision), the gestures only need data. */
+    s_present = true;
 
     ESP_RETURN_ON_ERROR(imu_write_u8(REG_RANGE, RANGE_4G), TAG, "range");
     ESP_RETURN_ON_ERROR(imu_write_u8(REG_ODR, ODR_125HZ), TAG, "odr");
@@ -111,4 +115,56 @@ esp_err_t msa321_init(void)
     s_inited = true;
     ESP_LOGI(TAG, "MSA321 ready  4g 125Hz");
     return ESP_OK;
+}
+
+bool msa321_present(void)
+{
+    return s_inited && s_present;
+}
+
+/* The MSA311/MSA321 register manual is not part of this tree and this build
+ * environment has no network access. The interrupt register addresses are
+ * deliberately absent instead of guessed: a wrong address would program an
+ * unrelated control register on real hardware.
+ *
+ * To enable motion wake, fill msa321_int_config_motion() and
+ * msa321_int_clear() from the register manual (any-motion threshold and
+ * duration, interrupt enable, INT1 mapping, push-pull / active high / latched
+ * configuration, status clear) and set the switch below to 1. imu_app and the
+ * power manager pick it up without further changes. */
+#ifndef MSA321_INT_REGS_VERIFIED
+#define MSA321_INT_REGS_VERIFIED 0
+#endif
+
+bool msa321_int_ready(void)
+{
+    return msa321_present() && MSA321_INT_REGS_VERIFIED;
+}
+
+esp_err_t msa321_int_config_motion(void)
+{
+    if (!msa321_present()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+#if MSA321_INT_REGS_VERIFIED
+    /* Program any-motion threshold/duration, enable it, map it to INT1 and set
+     * push-pull, active high, latched. Return ESP_OK only after read-back. */
+    return ESP_ERR_NOT_SUPPORTED;
+#else
+    static bool warned;
+    if (!warned) {
+        warned = true;
+        ESP_LOGW(TAG, "motion interrupt unavailable: register table not verified");
+    }
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
+}
+
+esp_err_t msa321_int_clear(void)
+{
+    if (!msa321_int_ready()) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    /* Read the interrupt status register until the any-motion bit clears. */
+    return ESP_ERR_NOT_SUPPORTED;
 }

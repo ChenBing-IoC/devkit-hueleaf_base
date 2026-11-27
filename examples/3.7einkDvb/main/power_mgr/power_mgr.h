@@ -38,11 +38,27 @@
 #define POWER_USE_DEEP_SLEEP 1
 #endif
 
+/* Motion wake: add the accelerometer any-motion interrupt (GPIO4) as an extra
+ * deep sleep wake source next to the timer and the power key. The IMU must be
+ * present and its interrupt register table verified; otherwise this silently
+ * stays out of the way and the other sources still apply. Set to 0 to keep
+ * GPIO4 out of the wake configuration entirely. */
+#ifndef POWER_IMU_WAKE
+#define POWER_IMU_WAKE 1
+#endif
+
 /* Default timer wake interval in minutes (0 disables scheduled wakes). The
  * value lives in NVS ("pwrmgr"/"interval_min") and can be changed from
  * /api/power, so this is only the first-boot default. */
 #ifndef POWER_WAKE_INTERVAL_MIN
 #define POWER_WAKE_INTERVAL_MIN 60
+#endif
+
+/* Last-resort wake interval used when a deep sleep would otherwise have no
+ * armed source at all (for example the IMU interrupt failed after the policy
+ * pre-check). Keeps a sensor fault from parking the MCU until the battery dies. */
+#ifndef POWER_FALLBACK_WAKE_MIN
+#define POWER_FALLBACK_WAKE_MIN 60
 #endif
 
 /* Upper bound for the stored interval (one week); a malformed POST cannot

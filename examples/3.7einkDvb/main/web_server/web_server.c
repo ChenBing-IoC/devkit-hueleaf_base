@@ -18,6 +18,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "imu_app.h"
 #include "screen_driver.h"
 #include "screen_ui.h"
 #include "wifi_mgr.h"
@@ -788,11 +789,35 @@ static esp_err_t slot_get_handler(httpd_req_t *req)
     return sent;
 }
 
+/* Read-only accelerometer state: last sample, orientation, gesture counters
+ * and whether GPIO4 would be armed as a deep sleep wake source. */
+static esp_err_t imu_get_handler(httpd_req_t *req)
+{
+    imu_app_status_t st;
+    imu_app_status(&st);
+    char json[320];
+    const int n = snprintf(json, sizeof(json),
+        "{\"ok\":true,\"present\":%s,\"x\":%.3f,\"y\":%.3f,\"z\":%.3f,"
+        "\"orientation\":\"%s\",\"events\":{\"flip\":%u,\"tap\":%u},"
+        "\"int_ready\":%s,\"wake_armed\":%s}",
+        st.present ? "true" : "false",
+        (double)st.x_g, (double)st.y_g, (double)st.z_g,
+        imu_app_orientation_name(st.orientation),
+        (unsigned)st.flip_events, (unsigned)st.tap_events,
+        st.int_ready ? "true" : "false",
+        st.wake_armed ? "true" : "false");
+    if (n < 0 || (size_t)n >= sizeof(json)) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "imu response overflow");
+        return ESP_FAIL;
+    }
+    return send_json(req, json);
+}
+
 esp_err_t web_server_start(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
-    config.max_uri_handlers = 16;
+    config.max_uri_handlers = 17;
     config.stack_size = 12288;
     config.max_open_sockets = 7;
     config.recv_wait_timeout = 5;
@@ -827,6 +852,7 @@ esp_err_t web_server_start(void)
         { .uri = "/api/clear", .method = HTTP_POST, .handler = clear_post_handler },
         { .uri = "/api/slots", .method = HTTP_GET, .handler = slots_get_handler },
         { .uri = "/api/slot", .method = HTTP_GET, .handler = slot_get_handler },
+        { .uri = "/api/imu", .method = HTTP_GET, .handler = imu_get_handler },
     };
     if (s_thumb_mutex == NULL) s_thumb_mutex = xSemaphoreCreateMutex();
     for (size_t i = 0; i < sizeof(handlers) / sizeof(handlers[0]); i++) {

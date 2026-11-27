@@ -8,6 +8,7 @@
 #include "nfc_driver.h"
 #include "pcf8563.h"
 #include "msa321.h"
+#include "imu_app.h"
 #include "pin_map.h"
 #include "power_mgr.h"
 #include "screen_driver.h"
@@ -196,6 +197,25 @@ void app_main(void)
         }
     }
 
+    /* The IMU shares I2C0: initialise it before the maintenance branch so a
+     * timer wake can arm motion wake for its next sleep too. */
+    esp_err_t imu_err = msa321_init();
+    if (imu_err != ESP_OK) {
+        ESP_LOGW(TAG, "IMU init failed: %s", esp_err_to_name(imu_err));
+    } else {
+        /* A GPIO wake leaves INT1 latched; drop the event now so the next
+         * sleep is not woken immediately by the same one. */
+        imu_app_clear_wake();
+        msa321_sample_t sample;
+        imu_err = msa321_read(&sample);
+        if (imu_err == ESP_OK) {
+            ESP_LOGI(TAG, "IMU acceleration x=%.3f y=%.3f z=%.3f g",
+                     (double)sample.x_g, (double)sample.y_g, (double)sample.z_g);
+        } else {
+            ESP_LOGW(TAG, "IMU read failed: %s", esp_err_to_name(imu_err));
+        }
+    }
+
     /* A scheduled wake runs the maintenance session and returns to deep sleep;
      * a latched key turns it into the normal interactive boot below. */
     if (maintenance) {
@@ -204,20 +224,6 @@ void app_main(void)
         } else {
             /* Connects, sets the clock, then deep sleeps: no return. */
             power_mgr_maintenance_session();
-        }
-    }
-
-    esp_err_t imu_err = msa321_init();
-    if (imu_err != ESP_OK) {
-        ESP_LOGW(TAG, "IMU init failed: %s", esp_err_to_name(imu_err));
-    } else {
-        msa321_sample_t sample;
-        imu_err = msa321_read(&sample);
-        if (imu_err == ESP_OK) {
-            ESP_LOGI(TAG, "IMU acceleration x=%.3f y=%.3f z=%.3f g",
-                     (double)sample.x_g, (double)sample.y_g, (double)sample.z_g);
-        } else {
-            ESP_LOGW(TAG, "IMU read failed: %s", esp_err_to_name(imu_err));
         }
     }
 
@@ -243,6 +249,13 @@ void app_main(void)
     } else {
         wifi_mgr_set_ready_cb(on_lan_ready);
         xTaskNotify(s_screen_task, SCREEN_EVENT_NETWORK, eSetBits);
+    }
+
+    /* Gestures need the panel rotation lock and the web server: start after
+     * both exist, and keep running when the sensor is absent. */
+    esp_err_t imu_app_err = imu_app_start();
+    if (imu_app_err != ESP_OK) {
+        ESP_LOGW(TAG, "IMU app: %s", esp_err_to_name(imu_app_err));
     }
 
     char url[48];

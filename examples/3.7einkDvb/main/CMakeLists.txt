@@ -5,6 +5,7 @@ idf_component_register(
         "pmic/axp2101.c"
         "rtc/pcf8563.c"
         "imu/msa321.c"
+        "imu/imu_app.c"
         "nfc_driver/nfc_driver.c"
         "screen_driver/screen_driver.c"
         "screen_driver/screen_rotation.c"
