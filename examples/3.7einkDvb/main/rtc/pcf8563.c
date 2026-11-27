@@ -1,5 +1,6 @@
 /*
- * PCF8563：上电写入当前编译日期时间，并提供回读。
+ * PCF8563：掉电保时的日历时钟。首次上电（VL 置位或读数不合理）用编译日期
+ * 初始化，之后由 SNTP 校时写回；开机再把 RTC 时间灌进系统时钟。
  */
 
 #include "pcf8563.h"
@@ -7,6 +8,8 @@
 #include <stddef.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/time.h>
+#include <time.h>
 #include "board.h"
 #include "driver/i2c_master.h"
 #include "esp_check.h"
@@ -16,6 +19,11 @@ static const char *TAG = "rtc";
 
 #define RTC_I2C_HZ           400000
 #define RTC_I2C_TIMEOUT_MS   50
+
+/* 2024-01-01T00:00:00Z，早于它的系统时间视为还没校过时。 */
+#define RTC_EPOCH_MIN        1704067200LL
+/* 2101-01-01T00:00:00Z，PCF8563 的年份上限是 2099。 */
+#define RTC_EPOCH_MAX        4133980800LL
 
 #define REG_CTRL1            0x00
 #define REG_CTRL2            0x01
@@ -147,6 +155,81 @@ esp_err_t pcf8563_get_time(pcf8563_time_t *time)
     return ESP_OK;
 }
 
+/* 公历日期转 Unix 天数（Howard Hinnant 算法）：不读本地时区，RTC 与 SNTP
+ * 统一按 UTC 解释。 */
+static int64_t days_from_civil(int year, unsigned month, unsigned day)
+{
+    year -= month <= 2;
+    const int era = (year >= 0 ? year : year - 399) / 400;
+    const unsigned yoe = (unsigned)(year - era * 400);
+    const unsigned doy = (153u * (month + (month > 2 ? -3u : 9u)) + 2u) / 5u + day - 1u;
+    const unsigned doe = yoe * 365u + yoe / 4u - yoe / 100u + doy;
+    return (int64_t)era * 146097 + (int64_t)doe - 719468;
+}
+
+static int64_t epoch_of(const pcf8563_time_t *t)
+{
+    return days_from_civil(t->year, t->month, t->day) * 86400 +
+           (int64_t)t->hour * 3600 + (int64_t)t->minute * 60 + t->second;
+}
+
+esp_err_t pcf8563_restore_system_time(void)
+{
+    pcf8563_time_t t;
+    struct timeval now;
+
+    if (!s_inited) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    ESP_RETURN_ON_ERROR(pcf8563_get_time(&t), TAG, "restore read");
+    const int64_t rtc = epoch_of(&t);
+    if (rtc < RTC_EPOCH_MIN || rtc >= RTC_EPOCH_MAX || t.month < 1 || t.month > 12 ||
+        t.day < 1 || t.day > 31 || t.hour > 23 || t.minute > 59 || t.second > 59) {
+        ESP_LOGW(TAG, "RTC %04u-%02u-%02u %02u:%02u:%02u implausible, wait for SNTP",
+                 t.year, t.month, t.day, t.hour, t.minute, t.second);
+        return ESP_ERR_INVALID_STATE;
+    }
+    gettimeofday(&now, NULL);
+    /* 只允许向前跳：SNTP 已经校准过的会话里不要把系统时钟拨回去。 */
+    if (rtc <= (int64_t)now.tv_sec) {
+        return ESP_OK;
+    }
+    struct timeval set = { .tv_sec = (time_t)rtc, .tv_usec = 0 };
+    if (settimeofday(&set, NULL) != 0) {
+        ESP_LOGW(TAG, "settimeofday failed");
+        return ESP_FAIL;
+    }
+    ESP_LOGI(TAG, "system clock %04u-%02u-%02u %02u:%02u:%02u from RTC",
+             t.year, t.month, t.day, t.hour, t.minute, t.second);
+    return ESP_OK;
+}
+
+esp_err_t pcf8563_save_system_time(void)
+{
+    if (!s_inited) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    const time_t now = time(NULL);
+    if ((int64_t)now < RTC_EPOCH_MIN || (int64_t)now >= RTC_EPOCH_MAX) {
+        /* 还没校过时（系统时间停在 1970）：不要把无效值写进 RTC。 */
+        return ESP_ERR_INVALID_STATE;
+    }
+    struct tm utc;
+    if (gmtime_r(&now, &utc) == NULL) {
+        return ESP_FAIL;
+    }
+    pcf8563_time_t t = {
+        .year = (uint16_t)(utc.tm_year + 1900),
+        .month = (uint8_t)(utc.tm_mon + 1),
+        .day = (uint8_t)utc.tm_mday,
+        .weekday = (uint8_t)utc.tm_wday,
+        .hour = (uint8_t)utc.tm_hour,
+        .minute = (uint8_t)utc.tm_min,
+        .second = (uint8_t)utc.tm_sec,
+    };
+    return pcf8563_set_time(&t);
+}
+
 esp_err_t pcf8563_init(void)
 {
     pcf8563_time_t now = {0};
@@ -170,11 +253,25 @@ esp_err_t pcf8563_init(void)
     ESP_RETURN_ON_ERROR(rtc_write_u8(REG_CTRL2, 0x00), TAG, "ctrl2");
     s_inited = true;
 
-    compile_time(&now);
-    ESP_RETURN_ON_ERROR(pcf8563_set_time(&now), TAG, "set now");
+    /* RTC 由自己的纽扣电池供电，跨深睡和掉电都在走：只有在从未设置过
+     * （VL 置位）或读数明显不合理时才用编译时间兜底，否则保留原值。 */
+    uint8_t raw[7] = {0};
+    bool seeded = false;
+    const esp_err_t read_err = rtc_read(REG_SECONDS, raw, sizeof(raw));
+    const bool vl = read_err == ESP_OK && (raw[0] & SECONDS_VL) != 0;
+    const bool plausible = !vl &&
+        bcd2bin(raw[6]) >= 24 && bcd2bin(raw[6]) <= 99 &&
+        bcd2bin(raw[5] & 0x1F) >= 1 && bcd2bin(raw[5] & 0x1F) <= 12 &&
+        bcd2bin(raw[3] & 0x3F) >= 1 && bcd2bin(raw[3] & 0x3F) <= 31;
+    if (!plausible) {
+        compile_time(&now);
+        ESP_LOGW(TAG, "RTC %s, seed from build time", vl ? "VL set" : "out of range");
+        ESP_RETURN_ON_ERROR(pcf8563_set_time(&now), TAG, "set now");
+        seeded = true;
+    }
     ESP_RETURN_ON_ERROR(pcf8563_get_time(&rd), TAG, "readback");
-    ESP_LOGI(TAG, "PCF8563 set %04u-%02u-%02u %s %02u:%02u:%02u",
-             rd.year, rd.month, rd.day,
+    ESP_LOGI(TAG, "PCF8563 %s %04u-%02u-%02u %s %02u:%02u:%02u",
+             seeded ? "set" : "kept", rd.year, rd.month, rd.day,
              rd.weekday < 7 ? k_wday[rd.weekday] : "?",
              rd.hour, rd.minute, rd.second);
     return ESP_OK;

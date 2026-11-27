@@ -149,6 +149,12 @@ static void on_lan_ready(void)
 void app_main(void)
 {
     ESP_LOGI(TAG, "Eink E6 3.7  ESP32-C5");
+
+    /* First: the stored sleep policy, the deep sleep wake pins and the reason
+     * this boot happened decide between the interactive and the maintenance
+     * session, so both are known before any subsystem starts. */
+    power_mgr_boot_init();
+
     esp_err_t board_err = board_init();
 
     if (board_err != ESP_OK) {
@@ -159,12 +165,46 @@ void app_main(void)
 
     if (board_err != ESP_OK) {
         ESP_LOGE(TAG, "board_init failed: %s", esp_err_to_name(board_err));
+        if (power_mgr_boot_maintenance()) {
+            (void)power_mgr_deep_sleep();
+        }
         return;
     }
+
+    /* The PMIC is reachable: read the power key latch before anything else so
+     * a press during the sleep upgrades this timer wake to an interactive
+     * session (the only key path when GPIO25 cannot wake the MCU). */
+    const bool maintenance = power_mgr_boot_maintenance();
+    bool pwron_latched = false;
+    if (maintenance) {
+        esp_err_t pwr_err = axp2101_take_pwron_short_press(&pwron_latched);
+        if (pwr_err != ESP_OK) {
+            ESP_LOGW(TAG, "PWRON read: %s", esp_err_to_name(pwr_err));
+        }
+    }
+
     /* Optional I2C peripherals share the bus and lock created by board_init. */
     esp_err_t rtc_err = pcf8563_init();
     if (rtc_err != ESP_OK) {
         ESP_LOGW(TAG, "RTC init failed: %s", esp_err_to_name(rtc_err));
+    } else {
+        /* The RTC runs through deep sleep and power cycles; a plausible value
+         * seeds the system clock before SNTP gets a chance. */
+        esp_err_t clock_err = pcf8563_restore_system_time();
+        if (clock_err != ESP_OK) {
+            ESP_LOGD(TAG, "clock from RTC: %s", esp_err_to_name(clock_err));
+        }
+    }
+
+    /* A scheduled wake runs the maintenance session and returns to deep sleep;
+     * a latched key turns it into the normal interactive boot below. */
+    if (maintenance) {
+        if (pwron_latched) {
+            power_mgr_promote_wake();
+        } else {
+            /* Connects, sets the clock, then deep sleeps: no return. */
+            power_mgr_maintenance_session();
+        }
     }
 
     esp_err_t imu_err = msa321_init();

@@ -354,6 +354,91 @@ static esp_err_t charge_post_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* Sleep policy and the boot-time wake facts; the page shows the same values so
+ * a degraded (timer-only) wake is visible instead of guessed. */
+static void send_power_json(httpd_req_t *req)
+{
+    char json[384];
+    const power_mgr_config_t cfg = power_mgr_config();
+    const int soc = axp2101_battery_percent();
+    const int n = snprintf(json, sizeof(json),
+        "{\"ok\":true,\"mode\":\"%s\",\"interval_min\":%u,\"deep_ok\":%s,"
+        "\"wake_pins\":{\"25\":%s,\"4\":%s,\"28\":%s,\"23\":%s},"
+        "\"last_wake\":\"%s\",\"usb\":%s,\"batt\":%d,\"sleep_state\":\"%s\"}",
+        power_mgr_mode_name(cfg.mode), (unsigned)cfg.interval_min,
+        power_mgr_deep_ok() ? "true" : "false",
+        power_mgr_wake_pin_valid(25) ? "true" : "false",
+        power_mgr_wake_pin_valid(4) ? "true" : "false",
+        power_mgr_wake_pin_valid(28) ? "true" : "false",
+        power_mgr_wake_pin_valid(23) ? "true" : "false",
+        power_mgr_last_wake_name(),
+        axp2101_is_usb_connected() ? "true" : "false",
+        soc, power_mgr_state_name());
+    if (n < 0 || (size_t)n >= sizeof(json)) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "power response overflow");
+        return;
+    }
+    (void)send_json(req, json);
+}
+
+static esp_err_t power_get_handler(httpd_req_t *req)
+{
+    send_power_json(req);
+    return ESP_OK;
+}
+
+static esp_err_t power_post_handler(httpd_req_t *req)
+{
+    char body[128];
+    if (req->content_len == 0 || req->content_len >= sizeof(body)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "body size");
+        return ESP_FAIL;
+    }
+    size_t used = 0;
+    while (used < req->content_len) {
+        int n = httpd_req_recv(req, body + used, req->content_len - used);
+        if (n <= 0) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "incomplete power request");
+            return ESP_FAIL;
+        }
+        used += (size_t)n;
+    }
+    body[used] = 0;
+
+    const power_mgr_config_t cur = power_mgr_config();
+    cJSON *root = cJSON_ParseWithOpts(body, NULL, true);
+    const cJSON *interval = cJSON_GetObjectItemCaseSensitive(root, "interval_min");
+    const cJSON *mode = cJSON_GetObjectItemCaseSensitive(root, "mode");
+    int pwr_mode = (int)cur.mode;
+    if (mode) {
+        pwr_mode = -1;
+        if (cJSON_IsString(mode)) {
+            if (!strcmp(mode->valuestring, "auto")) pwr_mode = POWER_MODE_AUTO;
+            else if (!strcmp(mode->valuestring, "light")) pwr_mode = POWER_MODE_LIGHT;
+            else if (!strcmp(mode->valuestring, "deep")) pwr_mode = POWER_MODE_DEEP;
+        }
+    }
+    const double interval_min = interval && cJSON_IsNumber(interval)
+                                    ? interval->valuedouble : (double)cur.interval_min;
+    const bool valid = cJSON_IsObject(root) && pwr_mode >= 0 &&
+        (!interval || cJSON_IsNumber(interval)) &&
+        interval_min >= 0 && interval_min <= POWER_INTERVAL_MAX_MIN &&
+        interval_min == (uint16_t)interval_min;
+    cJSON_Delete(root);
+    if (!valid) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                            "mode auto|light|deep, interval_min 0..10080");
+        return ESP_FAIL;
+    }
+    esp_err_t err = power_mgr_set_config((power_mgr_mode_t)pwr_mode, (uint16_t)interval_min);
+    if (err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, esp_err_to_name(err));
+        return ESP_FAIL;
+    }
+    send_power_json(req);
+    return ESP_OK;
+}
+
 static esp_err_t wifi_scan_handler(httpd_req_t *req)
 {
     static char json[2048];
@@ -707,7 +792,7 @@ esp_err_t web_server_start(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
-    config.max_uri_handlers = 14;
+    config.max_uri_handlers = 16;
     config.stack_size = 12288;
     config.max_open_sockets = 7;
     config.recv_wait_timeout = 5;
@@ -734,6 +819,8 @@ esp_err_t web_server_start(void)
         { .uri = "/api/wifi/connect", .method = HTTP_POST, .handler = wifi_connect_handler },
         { .uri = "/api/charge", .method = HTTP_GET, .handler = charge_get_handler },
         { .uri = "/api/charge", .method = HTTP_POST, .handler = charge_post_handler },
+        { .uri = "/api/power", .method = HTTP_GET, .handler = power_get_handler },
+        { .uri = "/api/power", .method = HTTP_POST, .handler = power_post_handler },
         { .uri = "/api/frame", .method = HTTP_POST, .handler = frame_post_handler },
         { .uri = "/api/job", .method = HTTP_GET, .handler = job_get_handler },
         { .uri = "/api/panel", .method = HTTP_GET, .handler = panel_get_handler },

@@ -61,7 +61,7 @@ SPI 主机为 SPI2。板级代码将共享总线访问串行化；自行添加 S
 | PMIC_IRQ | GPIO25 | AXP2101 nIRQ，低有效，下降沿通知任务 |
 | RTC_IRQ | GPIO23 | PCF8563 中断网络；当前固件将其配置为输入 |
 | 画面按键 | GPIO28 | 低电平按下，内部上拉；唤醒状态下切换到下一张缓存图片（带 IP 小字），并重新开始 2 分钟 Wi-Fi 计时 |
-| 电源按键 | AXP2101 PWRON | 由 PMIC 中断/状态寄存器读取，不占用独立 MCU GPIO；低功耗时短按唤醒，唤醒状态短按切换白屏/恢复画面 |
+| 电源按键 | AXP2101 PWRON | 由 PMIC 中断/状态寄存器读取（nIRQ 接 GPIO25），不占用独立 MCU GPIO；浅睡时短按唤醒，深睡时只在 GPIO25 属于 LP 域时可直接唤醒，否则事件被 PMIC 锁存在下次定时唤醒时生效；唤醒状态短按切换白屏/恢复画面 |
 
 屏幕逻辑方向默认值在 `main/pin_map.h` 的 `EINK_ROTATION` 中设置，运行中不再由按键旋转。GPIO28 还与原理图标注的启动绑带网络相关；更改上拉、电路或启动配置前应检查 ESP32-C5 启动要求。
 
@@ -108,21 +108,27 @@ SPI 主机为 SPI2。板级代码将共享总线访问串行化；自行添加 S
 
 | 状态 | 进入条件 | 处理 |
 | --- | --- | --- |
-| ACTIVE | 上电、唤醒后 | Wi-Fi 与 HTTP 服务正常；每次网页请求、按键操作、屏幕任务都会刷新活动时间戳 |
-| LOW_POWER | 无热点客户端，且距上次活动超过 `POWER_IDLE_TIMEOUT_MS`（默认 2 分钟） | 调用 `wifi_mgr_suspend()` 关闭 SoftAP、停止 Wi-Fi 射频；去掉画面底部 IP 小字并切换到下一张缓存图片（无图片时显示 LOW POWER 提示）；MCU 每 `POWER_SLEEP_POLL_MS`（默认 500 ms）以轻睡眠定时唤醒，通过 I²C 读取 AXP2101 中断状态判断电源键单击 |
-| OFF | 低功耗持续 `POWER_AUTO_OFF_MS`（默认 30 分钟）且未接 USB | 写 AXP2101 `COMMON_CONFIG` bit0 软件关机，DCDC/LDO 全部关断，仅 PWRON 可重新开机 |
+| ACTIVE | 上电、按键唤醒、维护唤醒被按键升级后 | Wi-Fi 与 HTTP 服务正常；每次网页请求、按键操作、屏幕任务都会刷新活动时间戳 |
+| LOW_POWER（深睡） | 无热点客户端，且距上次活动超过 `POWER_IDLE_TIMEOUT_MS`（默认 2 分钟），策略选择深睡（电池供电且「自动」、或「强制深睡」） | 调用 `wifi_mgr_suspend()` 关闭 SoftAP、停止 Wi-Fi 射频；去掉画面底部 IP 小字并切换到下一张缓存图片（无图片时显示 LOW POWER 提示）；把系统时间写回 PCF8563；`esp_deep_sleep_start()`，由 RTC 定时器按 `interval_min` 唤醒 |
+| LOW_POWER（浅睡） | 同上但策略选择浅睡（插 USB 且「自动」、或「仅浅睡」） | 旧行为：MCU 每 `POWER_SLEEP_POLL_MS`（默认 500 ms）以轻睡眠定时唤醒，通过 I²C 读取 AXP2101 中断状态判断电源键单击 |
+| MAINTENANCE | 定时器唤醒（`ESP_SLEEP_WAKEUP_TIMER`）且没有锁存的电源键事件 | 不开热点；有 STA 凭据时只连 STA（10 秒上限），SNTP 校时并写回 PCF8563、记录电量，运行唤醒任务钩子；不碰屏幕；整段 45 秒上限，随后继续深睡 |
+| OFF | 定时唤醒关闭时低功耗持续 `POWER_AUTO_OFF_MS`（默认 30 分钟）且未接 USB；或未接 USB 且电量有效低于 `POWER_BATT_CUTOFF_PCT`（默认 5%） | 写 AXP2101 `COMMON_CONFIG` bit0 软件关机，DCDC/LDO 全部关断，仅 PWRON 可重新开机 |
 
 要点：
 
 - 热点客户端数量由 `wifi_mgr` 统计（`WIFI_EVENT_AP_STACONNECTED` / `STADISCONNECTED`），数量大于 0 时 `power_mgr` 持续刷新活动时间戳，因此不会进入低功耗；断开后重新开始计时，符合「AP 有客户端时不休眠」的约定。
 - 唤醒后调用 `wifi_mgr_resume()`：有保存的 STA 凭据时先尝试连接路由器（12 秒），失败则重新打开配网热点；屏幕由 `main.c` 的 `screen_task` 重绘网络页。
-- 低功耗轮询使用 `esp_light_sleep_start()` + 定时唤醒，而不是深度睡眠，目的是保留 RAM 中的网页服务、图像缓存和屏幕状态；唤醒后无需重启，热点可在几百毫秒内恢复。
-- 低功耗期间 `power_mgr` 持有 `screen_rotation` 锁再进入睡眠，避免 SPI/Flash 任务与睡眠重叠。轻睡眠会冻结负责喂狗的空闲任务，因此进入低功耗前用 `esp_task_wdt_reconfigure()` 暂停任务看门狗，唤醒后按原配置恢复，避免长睡眠触发 TWDT。
+- 唤醒原因在 `app_main` 一开始由 `power_mgr_boot_init()` 分类：`ESP_SLEEP_WAKEUP_TIMER` 走维护会话，`EXT1` / `GPIO` 或上电、复位走交互会话。定时唤醒后第一时间读 AXP2101 短按状态，若睡眠期间按过电源键（事件被 PMIC 锁存）则把本次会话升级为交互唤醒。
+- 深睡唤醒源在启动时用 `esp_sleep_is_valid_wakeup_gpio()` 自检 GPIO25/4/28/23 并打印 `deep wake pins:` 日志。ESP32-C5 只有 LP 域 GPIO（0~6）能做深睡唤醒源；GPIO25 有效时用 `ESP_EXT1_WAKEUP_ALL_LOW` 单脚唤醒，无效时降级为纯定时器唤醒 + 锁存按键升级，`/api/power` 的 `deep_ok` 反映实际能力。
+- 浅睡轮询使用 `esp_light_sleep_start()` + 定时唤醒；深睡则完全断电重启，靠 PCF8563 保时（开机 `pcf8563_restore_system_time()` 只向前调表，SNTP 成功后 `pcf8563_save_system_time()` 写回）。
+- 两种睡眠都在 `power_mgr` 持有 `screen_rotation` 锁、且 `web_server_screen_busy()` / `screen_rotation_busy()` 为假之后才进入，避免 SPI/Flash 任务与睡眠重叠。浅睡会冻结负责喂狗的空闲任务，因此进入低功耗前用 `esp_task_wdt_reconfigure()` 暂停任务看门狗，唤醒后按原配置恢复，避免长睡眠触发 TWDT。
 - 画面底部的白底黑字小字（`AP 192.168.4.1` 或 `STA <ip>`）只在工作状态显示，由驱动在 SPI 发送前临时叠加，不会写入图片缓存；进入低功耗时先清掉小字，再按槽位顺序刷新下一张图片，因此「有无 IP 小字」就是低功耗状态的直观指示，待机画面仍是完整无水印的一张图。屏幕被电源键刷白（清屏）时保持白屏，不参与切换。
 - 三个图片槽位保存在 `image_cache` 分区，掉电不丢；网页上传可指定槽位（`X-Eink-Slot`），页面通过 `/api/slots`、`/api/slot?i=N` 显示三个槽位的缩略图。
 - 固件内置三张 480 × 720 六色示例帧（`main/screen_driver/defaults/pic*.bin`，由 `demo_images/pack_default_frames.py` 从示范 PNG 生成）。`screen_rotation_init()` 发现三个槽位都无效时会把它们写入缓存，因此新机器或旧缓存格式升级后开机即可显示图片而不是配网文字；已有有效图片的设备不会被覆盖。
-- 充电时（`axp2101_is_usb_connected()` 为真）只降功耗、不自动关机，避免 USB 供电状态下意外断电。
-- 若产品需要更激进的续航，可把 `POWER_AUTO_OFF_MS` 调小或改为进入 `esp_deep_sleep_start()`；深度睡眠下 ESP32-C5 只有 GPIO0~6 可作为唤醒源，而电源键接在 AXP2101 上，需额外方案（如定时轮询 AXP 中断）才能保持按键唤醒。
+- 充电时（`axp2101_is_usb_connected()` 为真）「自动」策略只降功耗到浅睡、不深睡也不自动关机，避免 USB 调试和充电过程中意外断电；「强制深睡」则无视 USB。
+- 自动关机规则随定时唤醒变化：`interval_min > 0` 时不再执行 30 分钟关机（否则定时唤醒会被关掉），只保留电量保护；把唤醒间隔设为 0 才恢复 `POWER_AUTO_OFF_MS` 规则。
+- 睡眠策略与唤醒间隔保存在 NVS 命名空间 `pwrmgr`（`interval_min`、`mode`），网页「设置」页或 `GET/POST /api/power` 读写，下一次进入低功耗时生效。
+- 若产品需要更激进的续航，可进一步关闭面板电源轨或调用 `screen_driver_deep_sleep()`；注意后者会让面板进入深睡，唤醒后需要重新初始化面板才能刷新。
 
 ## 5. 开发环境与构建
 
@@ -149,8 +155,8 @@ idf.py -p COMx flash monitor
 | --- | --- | --- |
 | 板级总线与锁 | `main/board/board.c`、`main/pin_map.h` | 初始化 SPI2、I²C0，管理共享锁和 IRQ 输入 |
 | 电子紙驱动 | `main/screen_driver/` | 初始化 EPD037A02，写入六色帧，流式接收并刷新，支持休眠 |
-| Wi-Fi 配网 | `main/wifi_mgr/` | SoftAP 初始开放网络名为 `Eink E6 3.7`，访问 `http://192.168.4.1`；配置 STA 后切换到局域网地址；提供 `wifi_mgr_suspend()` / `wifi_mgr_resume()` 供低功耗使用 |
-| 低功耗管理 | `main/power_mgr/` | 2 分钟无网络活动关闭 AP 并进入轻睡眠，电源键唤醒重开 AP，低功耗 30 分钟后软件关机 |
+| Wi-Fi 配网 | `main/wifi_mgr/` | SoftAP 初始开放网络名为 `Eink E6 3.7`，访问 `http://192.168.4.1`；配置 STA 后切换到局域网地址；提供 `wifi_mgr_suspend()` / `wifi_mgr_resume()` 供低功耗使用，`wifi_mgr_sta_start()` 供定时维护唤醒只连 STA |
+| 低功耗管理 | `main/power_mgr/` | 2 分钟无网络活动关闭 AP：电池供电深睡 + 定时唤醒（维护会话只校时、不刷屏），插 USB 保持浅睡；电源键唤醒重开 AP；定时唤醒关闭时保留 30 分钟关机，另有 5% 电量保护 |
 | Web 屏幕服务 | `main/web_server/` | 浏览器端图像上传和设备状态接口 |
 | TF 卡 | `main/tf_card/` | 与屏幕共用 SPI2；以 FAT 文件系统挂载到 `/sdcard`，不自动格式化卡 |
 | PMIC | `main/pmic/axp2101.c` | 初始化电源管理、读取电池/充电状态和电源键事件 |
@@ -164,9 +170,9 @@ SoftAP 当前配置为开放网络，仅建议在受控开发环境中使用。�
 - 屏幕和 TF 卡共享 SPI2。并行访问需遵循板级 SPI 锁和独立片选管理，避免在文件操作期间直接操作另一设备。
 - PMIC、IMU 和 RTC 共用 I²C0。不要重复初始化相同 GPIO 的独立 I²C 控制器；添加设备时沿用共享总线并加锁。
 - TF 卡初始化失败不会自动格式化介质；确认 FAT 文件系统、卡片和 CS 连接后再排查。
-- 当前 RTC 驱动每次启动都写入编译时间，若需要掉电走时或 SNTP 校时策略，应先调整 RTC 初始化策略。
+- PCF8563 只在首次使用（VL 置位或读数不合理）时写入编译时间，之后开机读取并灌入系统时钟，SNTP 校时成功后写回；调试时注意不要用编译时间覆盖现场走时。
 - 出货版本不具备 NFC 功能。扩展其他外设时，分配 GPIO 前请检查启动绑带、板上连线和当前固件占用，避免影响启动或已有功能。
 - 电池容量为 500 mAh，标称电压 3.7 V。涉及充电、电池保护或续航评估时，应结合实际使用工况和电源管理配置验证。
-- 固件默认会在 2 分钟无网络活动后关闭 Wi-Fi 并进入轻睡眠：串口日志停止、网页断开属于预期行为，按一次电源键即可恢复。长时间连机调试时，可临时调大 `main/power_mgr/power_mgr.h` 中的 `POWER_IDLE_TIMEOUT_MS`；USB 供电不会阻止进入低功耗，只阻止自动关机。
+- 固件默认会在 2 分钟无网络活动后关闭 Wi-Fi：电池供电进入深睡（定时唤醒），USB 供电保持浅睡。深睡时串口日志停止、网页断开属于预期行为，按一次电源键即可恢复；若自检显示 GPIO25 不能作为深睡唤醒源，按键会被 PMIC 锁存并在下一次定时唤醒时生效，也可以长按电源键 4 秒关机后重新开机。长时间连机调试时，把 USB 插上（「自动」策略保持浅睡）、临时调大 `POWER_IDLE_TIMEOUT_MS`，或在网页「设置」里把睡眠策略设为「仅浅睡」；USB 供电不会阻止进入低功耗，只会改变睡眠深度和自动关机规则。
 
 

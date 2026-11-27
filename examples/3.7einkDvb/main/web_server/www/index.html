@@ -304,6 +304,17 @@
     textarea:focus, input[type="password"]:focus, input[type="number"]:focus { border-color: var(--accent); }
     input[type="checkbox"] { accent-color: var(--accent); width: 15px; height: 15px; margin: 0; }
     input[type="number"] { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.86rem; padding: 7px 8px; }
+    select {
+      width: 100%;
+      border: 1px solid var(--line-2);
+      border-radius: 2px;
+      background: var(--field);
+      color: var(--ink);
+      font: inherit;
+      padding: 8px 10px;
+      outline: none;
+    }
+    select:focus { border-color: var(--accent); }
 
     /* 细线网格：相邻格子共用同一条 1px 边线，空位留白不塌陷 */
     .quant-row {
@@ -685,6 +696,22 @@
       </div>
       <p class="status" :class="chargeStatusClass" role="status" aria-live="polite">{{ chargeStatus }}</p>
 
+      <div class="field" style="margin-top:18px">低功耗</div>
+      <label>定时唤醒间隔
+        <select v-model.number="powerInterval" :disabled="powerBusy || !powerReady" @change="powerDirty = true">
+          <option v-for="p in wakeIntervals" :key="p.min" :value="p.min">{{ p.label }}</option>
+        </select>
+      </label>
+      <label>睡眠策略
+        <select v-model="powerMode" :disabled="powerBusy || !powerReady" @change="powerDirty = true">
+          <option v-for="m in sleepModes" :key="m.id" :value="m.id">{{ m.label }} · {{ m.note }}</option>
+        </select>
+      </label>
+      <button class="push" type="button" :disabled="powerBusy || !powerReady" @click="savePower">保存低功耗设置</button>
+      <p class="hint">{{ powerDetail }}</p>
+      <p class="hint">深睡时整机断电，屏上画面保留。定时唤醒只连 STA 校时、记录电量，不刷新屏幕也不加 IP 小字。USB 供电时「自动」策略保持浅睡以便调试；关闭定时唤醒后恢复旧策略：低功耗 30 分钟自动关机，低电量（&lt;5%）也会保护关机。</p>
+      <p class="status" :class="powerStatusClass" role="status" aria-live="polite">{{ powerStatus }}</p>
+
     </div>
 
     <div v-show="tab === 'text' || tab === 'image'" class="editor-layout">
@@ -1025,6 +1052,43 @@
           { id: 'balanced', label: '正常充电', note: '0.5C · 默认档' },
           { id: 'fast', label: '快速充电', note: '1.0C' },
         ];
+        /* 低功耗策略与 /api/power 一一对应：下拉里的值直接是分钟数。 */
+        const powerMode = ref('auto');
+        const powerInterval = ref(60);
+        const powerDirty = ref(false);
+        const powerReady = ref(false);
+        const powerBusy = ref(false);
+        const powerStatus = ref('');
+        const powerStatusClass = ref('');
+        const powerDetail = ref('正在读取低功耗配置');
+        const wakeIntervals = [
+          { min: 0, label: '关闭' },
+          { min: 30, label: '30 分钟' },
+          { min: 60, label: '1 小时' },
+          { min: 360, label: '6 小时' },
+          { min: 1440, label: '每天' },
+        ];
+        const sleepModes = [
+          { id: 'auto', label: '自动', note: 'USB 浅睡，电池深睡' },
+          { id: 'light', label: '仅浅睡', note: '保持旧行为' },
+          { id: 'deep', label: '强制深睡', note: '插着 USB 也深睡' },
+        ];
+        const applyPowerInfo = (info, saved = false) => {
+          if (!powerDirty.value || saved) {
+            powerMode.value = info.mode || 'auto';
+            powerInterval.value = Number.isInteger(info.interval_min) ? info.interval_min : 60;
+          }
+          if (saved) powerDirty.value = false;
+          powerReady.value = true;
+          const wake = info.deep_ok
+            ? '电源键可直接唤醒'
+            : '电源键不在深睡唤醒域，按键在下一次定时唤醒时生效';
+          const stateName = { active: '运行中', low: '低功耗', maint: '定时维护', off: '已关机' }[info.sleep_state] || info.sleep_state || '';
+          powerDetail.value = (info.usb ? 'USB 供电' : '电池供电') +
+            ' · 电量 ' + (info.batt >= 0 ? info.batt + '%' : '未知') +
+            ' · ' + wake + ' · 上次唤醒 ' + (info.last_wake || '未知') +
+            (stateName ? ' · 当前 ' + stateName : '');
+        };
         const text = ref('你好，Eink');
         const bg = ref(0x1);
         const fg = ref(0x0);
@@ -1698,6 +1762,7 @@
  }
  }
             if (info.charge && !chargeBusy.value) applyChargeInfo(info);
+            if (deviceOnline.value && Date.now() - powerFetchedAt > 5000) refreshPower();
             /* Slot content changes on uploads and each low power entry. */
             const sig = `${info.images ?? ''}/${info.current ?? ''}`;
             if (deviceOnline.value && sig !== slotSignature) {
@@ -1759,6 +1824,47 @@
           chargeBusy.value = false;
         };
 
+        let powerInFlight = false, powerFetchedAt = 0;
+        const refreshPower = async () => {
+          if (powerInFlight || powerBusy.value) return;
+          powerInFlight = true;
+          try {
+            const info = await fetchJson('/api/power', { cache: 'no-store' }, 5000);
+            if (info.ok) applyPowerInfo(info);
+          } catch (_) {
+            /* offline: keep the last known policy */
+          }
+          powerInFlight = false;
+          powerFetchedAt = Date.now();
+        };
+
+        const savePower = async () => {
+          if (powerBusy.value || !powerReady.value) return;
+          if (!wakeIntervals.some(w => w.min === powerInterval.value) ||
+              !sleepModes.some(m => m.id === powerMode.value)) {
+            powerStatus.value = '请选择有效的唤醒间隔和睡眠策略';
+            powerStatusClass.value = 'err';
+            return;
+          }
+          powerBusy.value = true;
+          powerStatusClass.value = '';
+          powerStatus.value = '保存中';
+          try {
+            const info = await fetchJson('/api/power', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ mode: powerMode.value, interval_min: powerInterval.value }),
+            });
+            applyPowerInfo(info, true);
+            powerStatus.value = '已保存，下一次进入低功耗时生效';
+            powerStatusClass.value = 'ok';
+          } catch (e) {
+            powerStatusClass.value = 'err';
+            powerStatus.value = '保存失败，稍后重试';
+          }
+          powerBusy.value = false;
+        };
+
         const connectWifi = async () => {
           if (!selectedSsid.value || wifiBusy.value) return;
           wifiBusy.value = true;
@@ -1802,6 +1908,8 @@
           zoom, panX, panY, exposure, brightness, contrast, highlights, shadows, saturation,
           wifiMode, wifiSsid, wifiUrl, wifiList, selectedSsid, wifiPass, wifiBusy, wifiStatus, wifiStatusClass,
           chargeCapacity, chargeDirty, chargeReady, chargeDetail, gaugeDetail, chargePower, chargeBusy, chargeStatus, chargeStatusClass, chargeLevels,
+          powerMode, powerInterval, powerDirty, powerReady, powerBusy, powerStatus, powerStatusClass, powerDetail,
+          wakeIntervals, sleepModes, savePower,
           switchTab, renderText, onFileChange, onDrop, push, setQuant, setDitherQuality, setRenderStyle,
           clearDisplay,
           lastPanelFrame, regionUpdate, forceRefresh, updateRect, canRegionUpdate, setRegionUpdate,

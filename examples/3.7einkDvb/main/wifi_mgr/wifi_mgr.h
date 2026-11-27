@@ -17,6 +17,10 @@ typedef enum {
 typedef void (*wifi_mgr_ready_cb_t)(void);
 
 esp_err_t wifi_mgr_start(void);
+/* Maintenance wake: STA only, never the provisioning AP. ESP_ERR_NOT_FOUND
+ * means no saved credentials, ESP_ERR_TIMEOUT that the router was not
+ * reachable inside timeout_ms (the radio is left stopped). */
+esp_err_t wifi_mgr_sta_start(uint32_t timeout_ms);
 /* Low power handshake: suspend() closes the SoftAP and stops the radio while
  * keeping saved credentials, resume() brings the same network back. */
 esp_err_t wifi_mgr_suspend(void);

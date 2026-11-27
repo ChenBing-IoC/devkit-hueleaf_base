@@ -2,6 +2,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include "esp_check.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_mac.h"
@@ -270,14 +271,21 @@ static esp_err_t begin_network(uint32_t wait_ms)
     return start_apsta();
 }
 
-esp_err_t wifi_mgr_start(void)
+/* One-time stack bring-up shared by the interactive boot and the maintenance
+ * wake. Neither network nor radio is started here. */
+static esp_err_t init_common(void)
 {
+    if (s_events) {
+        return ESP_OK;
+    }
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
         err = nvs_flash_init();
     }
-    ESP_ERROR_CHECK(err);
+    if (err != ESP_OK) {
+        return err;
+    }
 
     s_lock = xSemaphoreCreateMutex();
     s_events = xEventGroupCreate();
@@ -299,8 +307,42 @@ esp_err_t wifi_mgr_start(void)
     ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
                                                         &wifi_event_handler, NULL, NULL));
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+    return ESP_OK;
+}
 
+esp_err_t wifi_mgr_start(void)
+{
+    ESP_RETURN_ON_ERROR(init_common(), TAG, "wifi init");
     return begin_network(BOOT_WAIT_MS);
+}
+
+esp_err_t wifi_mgr_sta_start(uint32_t timeout_ms)
+{
+    ESP_RETURN_ON_ERROR(init_common(), TAG, "wifi init");
+    if (!s_ssid[0]) {
+        return ESP_ERR_NOT_FOUND;
+    }
+    ESP_LOGI(TAG, "maintenance STA \"%s\", %u ms cap", s_ssid, (unsigned)timeout_ms);
+    xEventGroupClearBits(s_events, GOT_IP_BIT | STA_FAIL_BIT);
+    s_retry = 0;
+    esp_err_t err = esp_wifi_set_mode(WIFI_MODE_STA);
+    if (err != ESP_OK) return err;
+    err = config_sta(s_ssid, s_pass);
+    if (err != ESP_OK) return err;
+    err = esp_wifi_start();
+    if (err != ESP_OK && err != ESP_ERR_WIFI_CONN) return err;
+    apply_radio();
+    EventBits_t bits = xEventGroupWaitBits(s_events, GOT_IP_BIT | STA_FAIL_BIT,
+                                           pdFALSE, pdFALSE, pdMS_TO_TICKS(timeout_ms));
+    if (bits & GOT_IP_BIT) {
+        return ESP_OK;
+    }
+    /* No AP fallback: a scheduled wake that cannot reach the router just goes
+     * back to sleep with the radio off. */
+    (void)esp_wifi_stop();
+    s_sta_up = false;
+    s_sta_ip[0] = 0;
+    return ESP_ERR_TIMEOUT;
 }
 
 esp_err_t wifi_mgr_suspend(void)
