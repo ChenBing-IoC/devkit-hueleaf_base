@@ -9,12 +9,14 @@
 #include "esp_check.h"
 #include "esp_log.h"
 #include "esp_random.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "panel_lut.h"
 #include "pin_map.h"
 #include "panel_profile.h"
+#include "screen_rotation.h"
 
 static const char *TAG = "screen";
 
@@ -63,9 +65,11 @@ static esp_err_t wait_busy(void)
 }
 
 /* Every DRF must produce an observed low -> high BUSY cycle. Never turn a
- * missing assertion into a successful refresh after an arbitrary delay. */
-static esp_err_t wait_refresh(void)
+ * missing assertion into a successful refresh after an arbitrary delay.
+ * asserted reports whether BUSY was actually seen low, even on timeout. */
+static esp_err_t wait_refresh_ex(bool *asserted)
 {
+    if (asserted) *asserted = false;
     const TickType_t t0 = xTaskGetTickCount();
     while (gpio_get_level(eink_busy) != 0) {
         if ((TickType_t)(xTaskGetTickCount() - t0) >= pdMS_TO_TICKS(EPD037_DRF_ASSERT_MS)) {
@@ -74,10 +78,16 @@ static esp_err_t wait_refresh(void)
         }
         vTaskDelay(1);
     }
+    if (asserted) *asserted = true;
     ESP_RETURN_ON_ERROR(wait_busy(), TAG, "DRF busy");
     ESP_LOGI(TAG, "DRF busy %ums",
              (unsigned)((xTaskGetTickCount() - t0) * portTICK_PERIOD_MS));
     return ESP_OK;
+}
+
+static esp_err_t wait_refresh(void)
+{
+    return wait_refresh_ex(NULL);
 }
 
 static void lcd_spi_pre_transfer_callback(spi_transaction_t *t)
@@ -337,16 +347,11 @@ esp_err_t screen_driver_init(void)
     return ESP_OK;
 }
 
-static esp_err_t fill_screen(screen_color_t color, screen_upload_report_t *report)
+/* Caller holds the display lock and the board SPI lock. Shared with the
+ * partial probe's mandatory cleanup, which runs inside one lock window. */
+static esp_err_t fill_locked(screen_color_t color, screen_upload_report_t *report,
+                             TickType_t started)
 {
-    if (!s_ctx.inited) {
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    xSemaphoreTake(s_ctx.lock, portMAX_DELAY);
-    board_spi_lock();
-
-    const TickType_t started = xTaskGetTickCount();
     esp_err_t err = panel_six_color_init();
     if (err == ESP_OK) err = write_cmd(0x10);
     if (err == ESP_OK) err = wait_busy();
@@ -363,6 +368,20 @@ static esp_err_t fill_screen(screen_color_t color, screen_upload_report_t *repor
         report->display_generation = screen_driver_generation();
         report->completed = err == ESP_OK;
     }
+    return err;
+}
+
+static esp_err_t fill_screen(screen_color_t color, screen_upload_report_t *report)
+{
+    if (!s_ctx.inited) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    xSemaphoreTake(s_ctx.lock, portMAX_DELAY);
+    board_spi_lock();
+
+    const TickType_t started = xTaskGetTickCount();
+    const esp_err_t err = fill_locked(color, report, started);
 
     board_spi_unlock();
     xSemaphoreGive(s_ctx.lock);
@@ -541,6 +560,247 @@ esp_err_t screen_driver_upload(uint32_t expected_generation,
     board_spi_unlock();
     xSemaphoreGive(s_ctx.lock);
     return err;
+}
+
+/* ---- Partial-window bring-up probe --------------------------------------- */
+
+#define SCREEN_PARTIAL_WINDOW_BYTES 9
+
+bool screen_driver_partial_probe_enabled(void)
+{
+    return SCREEN_PARTIAL_PROBE_ENABLE != 0;
+}
+
+static uint32_t elapsed_ms(int64_t since_us)
+{
+    const int64_t delta = esp_timer_get_time() - since_us;
+    return delta <= 0 ? 0U : (uint32_t)(delta / 1000);
+}
+
+/* Map a logical rectangle onto the panel. The frame is gate-major:
+ * gate = 479 - px, and one RAM byte covers two pixels (rows = py / 2).
+ * Axis-aligned logical rectangles stay axis-aligned under 0/90/180/270, so
+ * four corners are enough. Y edges widen to whole byte rows, which can paint
+ * at most one extra pixel outside the requested window. */
+static bool probe_map_window(const screen_probe_req_t *req,
+                             uint16_t *gate_start, uint16_t *gate_end,
+                             uint16_t *row_start, uint16_t *row_end,
+                             int16_t *px0, int16_t *py0, int16_t *px1, int16_t *py1)
+{
+    if (req->rotation != 0 && req->rotation != 90 &&
+        req->rotation != 180 && req->rotation != 270) return false;
+    int logical_w = 0, logical_h = 0;
+    screen_rotation_size(req->rotation, &logical_w, &logical_h);
+    if (req->w < 8 || req->h < 8) return false;
+    if (req->x < 0 || req->y < 0) return false;
+    if (req->w > logical_w || req->h > logical_h) return false;
+    if (req->x > logical_w - req->w || req->y > logical_h - req->h) return false;
+
+    const int xs[2] = { req->x, req->x + req->w - 1 };
+    const int ys[2] = { req->y, req->y + req->h - 1 };
+    int min_x = SCREEN_WIDTH, max_x = -1, min_y = SCREEN_HEIGHT, max_y = -1;
+    for (int i = 0; i < 2; ++i) {
+        for (int j = 0; j < 2; ++j) {
+            int px = 0, py = 0;
+            screen_rotation_panel_xy(req->rotation, xs[i], ys[j], &px, &py);
+            if (px < min_x) min_x = px;
+            if (px > max_x) max_x = px;
+            if (py < min_y) min_y = py;
+            if (py > max_y) max_y = py;
+        }
+    }
+    if (min_x < 0 || max_x >= SCREEN_WIDTH || min_y < 0 || max_y >= SCREEN_HEIGHT) return false;
+
+    const int gs = SCREEN_WIDTH - 1 - max_x;
+    const int ge = SCREEN_WIDTH - 1 - min_x;
+    const int rs = min_y / 2;
+    const int re = max_y / 2;
+    if (gs < 0 || ge >= SCREEN_WIDTH || gs > ge) return false;
+    if (re >= SCREEN_HEIGHT / 2 || rs < 0 || rs > re) return false;
+
+    *gate_start = (uint16_t)gs;
+    *gate_end = (uint16_t)ge;
+    *row_start = (uint16_t)rs;
+    *row_end = (uint16_t)re;
+    *px0 = (int16_t)min_x;
+    *py0 = (int16_t)min_y;
+    *px1 = (int16_t)max_x;
+    *py1 = (int16_t)max_y;
+    return true;
+}
+
+/* Candidate JD/IST 9-byte 0x92 payload: two 9-bit fields per axis in
+ * little-endian order, then one control byte. X is the gate index (0..479) and
+ * Y is the RAM byte row (0..359). This layout is NOT confirmed on EPD037A02;
+ * it is the only reason the probe is compiled out by default. */
+static void build_partial_window(uint8_t payload[SCREEN_PARTIAL_WINDOW_BYTES],
+                                 uint16_t x_start, uint16_t x_end,
+                                 uint16_t y_start, uint16_t y_end)
+{
+    payload[0] = (uint8_t)(x_start & 0xFFU);
+    payload[1] = (uint8_t)((x_start >> 8) & 0x01U);
+    payload[2] = (uint8_t)(x_end & 0xFFU);
+    payload[3] = (uint8_t)((x_end >> 8) & 0x01U);
+    payload[4] = (uint8_t)(y_start & 0xFFU);
+    payload[5] = (uint8_t)((y_start >> 8) & 0x01U);
+    payload[6] = (uint8_t)(y_end & 0xFFU);
+    payload[7] = (uint8_t)((y_end >> 8) & 0x01U);
+    payload[8] = 0x00;
+}
+
+/* One solid ink inside the mapped window, in the same gate-then-row order as a
+ * full frame so the probe can pinpoint a swapped or offset window. */
+static esp_err_t write_window_pattern(uint16_t gate_start, uint16_t gate_end,
+                                      uint16_t row_start, uint16_t row_end,
+                                      uint8_t ink)
+{
+    const uint8_t value = (uint8_t)((ink << 4) | ink);
+    const size_t rows = (size_t)row_end - row_start + 1;
+    for (uint16_t gate = gate_start; gate <= gate_end; ++gate) {
+        ESP_RETURN_ON_ERROR(write_solid(value, rows), TAG, "probe window data");
+    }
+    return ESP_OK;
+}
+
+esp_err_t screen_driver_partial_probe(const screen_probe_req_t *req,
+                                      screen_probe_result_t *out)
+{
+    if (!out) return ESP_ERR_INVALID_ARG;
+    memset(out, 0, sizeof(*out));
+    if (!req) return ESP_ERR_INVALID_ARG;
+    out->rotation = req->rotation;
+    if (!screen_driver_partial_probe_enabled()) {
+        out->err = ESP_ERR_NOT_SUPPORTED;
+        return out->err;
+    }
+    if (!s_ctx.inited) {
+        out->err = ESP_ERR_INVALID_STATE;
+        return out->err;
+    }
+    if (req->repeat < 1 || req->repeat > 10 ||
+        (req->mode != SCREEN_PROBE_MODE_WRITE && req->mode != SCREEN_PROBE_MODE_REFRESH)) {
+        out->err = ESP_ERR_INVALID_ARG;
+        return out->err;
+    }
+
+    uint16_t gate_start = 0, gate_end = 0, row_start = 0, row_end = 0;
+    if (!probe_map_window(req, &gate_start, &gate_end, &row_start, &row_end,
+                          &out->px0, &out->py0, &out->px1, &out->py1)) {
+        out->err = ESP_ERR_INVALID_ARG;
+        return out->err;
+    }
+    out->gate_start = gate_start;
+    out->gate_end = gate_end;
+    out->row_start = row_start;
+    out->row_end = row_end;
+    out->bytes = (uint32_t)(gate_end - gate_start + 1) * (uint32_t)(row_end - row_start + 1);
+
+    xSemaphoreTake(s_ctx.lock, portMAX_DELAY);
+    board_spi_lock();
+
+    const int64_t probe_started = esp_timer_get_time();
+    esp_err_t first_err = panel_six_color_init();
+    bool partial_active = false;
+
+    if (first_err == ESP_OK) {
+        esp_err_t err = write_cmd(0x91);          /* partial in */
+        if (err == ESP_OK) partial_active = true;
+        if (err == ESP_OK) err = write_data_byte(0x00);
+        if (err != ESP_OK) first_err = err;
+    }
+    if (first_err == ESP_OK) {
+        uint8_t payload[SCREEN_PARTIAL_WINDOW_BYTES];
+        build_partial_window(payload, gate_start, gate_end, row_start, row_end);
+        esp_err_t err = write_cmd(0x92);          /* partial window */
+        if (err == ESP_OK) err = write_data(payload, sizeof(payload));
+        if (err != ESP_OK) first_err = err;
+    }
+
+    int64_t write_us = 0, drf_us = 0;
+    for (uint8_t pass = 0; pass < req->repeat && first_err == ESP_OK; ++pass) {
+        const int64_t write_started = esp_timer_get_time();
+        esp_err_t err = write_cmd(0x10);
+        if (err == ESP_OK) err = wait_busy();
+        if (err == ESP_OK) err = write_window_pattern(gate_start, gate_end,
+                                                      row_start, row_end,
+                                                      (uint8_t)SCREEN_COLOR_RED);
+        write_us += esp_timer_get_time() - write_started;
+        if (err != ESP_OK) {
+            first_err = err;
+            break;
+        }
+        ++out->repeats_done;
+
+        if (req->mode == SCREEN_PROBE_MODE_WRITE) continue;
+
+        err = panel_power_on();
+        if (err != ESP_OK) {
+            first_err = err;
+            break;
+        }
+        const int64_t drf_started = esp_timer_get_time();
+        bool asserted = false;
+        err = write_cmd(0x12);
+        if (err == ESP_OK) err = write_data_byte(0x00);
+        if (err == ESP_OK) {
+            err = wait_refresh_ex(&asserted);
+            if (asserted) {
+                out->busy_asserted = true;
+            } else {
+                ++out->busy_failures;
+            }
+        }
+        drf_us += esp_timer_get_time() - drf_started;
+        if (err != ESP_OK) {
+            first_err = err;
+            break;
+        }
+        err = panel_power_off();
+        if (err != ESP_OK) {
+            first_err = err;
+            break;
+        }
+    }
+    out->write_ms = (uint32_t)(write_us / 1000);
+    out->drf_ms = (uint32_t)(drf_us / 1000);
+
+    /* Leave partial mode no matter where the probe stopped. */
+    if (partial_active) {
+        const esp_err_t exit_err = write_cmd(0x90); /* partial out */
+        if (exit_err != ESP_OK) {
+            if (first_err == ESP_OK) first_err = exit_err;
+            out->exit_partial_ok = false;
+        } else {
+            out->exit_partial_ok = true;
+        }
+        delay_ms(10);
+    } else {
+        out->exit_partial_ok = true;
+    }
+
+    /* Mandatory clean frame. The reset inside this path also drops partial
+     * mode if 0x90 itself failed, so the panel cannot stay half-windowed. */
+    const int64_t cleanup_started = esp_timer_get_time();
+    esp_err_t cleanup_err = fill_locked(SCREEN_COLOR_WHITE, NULL, xTaskGetTickCount());
+    out->cleanup_ms = elapsed_ms(cleanup_started);
+    out->cleanup_ok = cleanup_err == ESP_OK;
+    if (first_err == ESP_OK && cleanup_err != ESP_OK) first_err = cleanup_err;
+
+    out->total_ms = elapsed_ms(probe_started);
+    out->err = first_err;
+
+    board_spi_unlock();
+    xSemaphoreGive(s_ctx.lock);
+
+    ESP_LOGI(TAG, "probe %s gate=%u..%u row=%u..%u bytes=%u repeat=%u/%u "
+             "write=%ums drf=%ums cleanup=%ums total=%ums busy=%d/%u",
+             esp_err_to_name(first_err), (unsigned)gate_start, (unsigned)gate_end,
+             (unsigned)row_start, (unsigned)row_end,
+             (unsigned)out->bytes, (unsigned)out->repeats_done, (unsigned)req->repeat,
+             (unsigned)out->write_ms, (unsigned)out->drf_ms,
+             (unsigned)out->cleanup_ms, (unsigned)out->total_ms,
+             out->busy_asserted ? 1 : 0, (unsigned)out->busy_failures);
+    return first_err;
 }
 
 esp_err_t screen_driver_deep_sleep(void)

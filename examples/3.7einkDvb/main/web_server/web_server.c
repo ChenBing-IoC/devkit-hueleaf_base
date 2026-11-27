@@ -31,7 +31,9 @@
 static const char *TAG = "web";
 
 typedef enum { JOB_IDLE, JOB_REFRESH, JOB_RECEIVING, JOB_ERROR } job_phase_t;
-typedef enum { JOB_FRAME, JOB_CLEAR_SCREEN, JOB_TF_IMPORT, JOB_TF_EXPORT } job_kind_t;
+typedef enum {
+    JOB_FRAME, JOB_CLEAR_SCREEN, JOB_TF_IMPORT, JOB_TF_EXPORT, JOB_PANEL_PROBE
+} job_kind_t;
 #define FRAME_FORMAT "otp6-v1"
 #define FRAME_CHUNK_BYTES 2048
 #define SLOT_COUNT 3
@@ -66,6 +68,11 @@ typedef struct {
     int slot;
 } tf_pending_t;
 static tf_pending_t s_tf_pending;
+/* Last partial-window probe request/result, published under s_job_lock. */
+static screen_probe_req_t s_probe_req;
+static screen_probe_result_t s_probe_result;
+static bool s_probe_ran;
+static uint32_t s_probe_at_ms;
 
 static void log_heap_stats(const char *event, uint32_t id)
 {
@@ -88,6 +95,7 @@ static const char *job_kind_name(job_kind_t kind)
     case JOB_CLEAR_SCREEN: return "clear-screen";
     case JOB_TF_IMPORT: return "tf-import";
     case JOB_TF_EXPORT: return "tf-export";
+    case JOB_PANEL_PROBE: return "panel-probe";
     default: return "frame";
     }
 }
@@ -97,6 +105,7 @@ static const char *job_sequence(job_kind_t kind)
     case JOB_CLEAR_SCREEN: return "otp6-clear-v1";
     case JOB_TF_IMPORT: return "tf-import-v1";
     case JOB_TF_EXPORT: return "tf-export-v1";
+    case JOB_PANEL_PROBE: return "panel-probe-v1";
     default: return FRAME_FORMAT;
     }
 }
@@ -957,6 +966,46 @@ static void frame_job_task(void *arg)
     for (;;) {
         (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
         const job_kind_t kind = s_job_kind;
+        if (kind == JOB_PANEL_PROBE) {
+            screen_probe_req_t probe_req;
+            portENTER_CRITICAL(&s_job_lock);
+            probe_req = s_probe_req;
+            portEXIT_CRITICAL(&s_job_lock);
+            screen_probe_result_t probe_result;
+            screen_upload_report_t probe_report = {0};
+            const TickType_t probe_started = xTaskGetTickCount();
+            screen_rotation_lock();
+            const esp_err_t probe_err = screen_driver_partial_probe(&probe_req, &probe_result);
+            const bool touched = probe_err != ESP_ERR_INVALID_ARG &&
+                                 probe_err != ESP_ERR_NOT_SUPPORTED &&
+                                 probe_err != ESP_ERR_INVALID_STATE;
+            if (touched) {
+                /* The probe already repainted a white full frame. Put the
+                 * stored picture back when one exists; otherwise keep it blank. */
+                screen_rotation_note_external();
+                if (screen_rotation_has_images()) {
+                    const esp_err_t replay = screen_rotation_show_image();
+                    if (replay != ESP_OK) {
+                        ESP_LOGW(TAG, "probe replay: %s", esp_err_to_name(replay));
+                    }
+                } else {
+                    screen_rotation_note_blank();
+                }
+            }
+            screen_rotation_unlock();
+            portENTER_CRITICAL(&s_job_lock);
+            s_probe_result = probe_result;
+            s_probe_ran = true;
+            s_probe_at_ms = (uint32_t)(esp_timer_get_time() / 1000);
+            portEXIT_CRITICAL(&s_job_lock);
+            probe_report.total_ms = (uint32_t)((xTaskGetTickCount() - probe_started) * portTICK_PERIOD_MS);
+            probe_report.refresh_ms = probe_result.drf_ms;
+            probe_report.completed = probe_err == ESP_OK;
+            probe_report.display_generation = screen_driver_generation();
+            finish_job(probe_err, &probe_report);
+            ESP_LOGI(TAG, "job panel-probe %s", esp_err_to_name(probe_err));
+            continue;
+        }
         if (kind == JOB_TF_IMPORT || kind == JOB_TF_EXPORT) {
             const tf_pending_t tf = s_tf_pending;
             screen_upload_report_t tf_report = {0};
@@ -1219,11 +1268,138 @@ static esp_err_t imu_get_handler(httpd_req_t *req)
     return send_json(req, json);
 }
 
+/* ---- Partial-window probe API (docs/panel_partial_probe.md) -------------- */
+
+static const char *probe_mode_name(screen_probe_mode_t mode)
+{
+    return mode == SCREEN_PROBE_MODE_WRITE ? "write" : "refresh";
+}
+
+static esp_err_t probe_get_handler(httpd_req_t *req)
+{
+    screen_probe_result_t result;
+    screen_probe_req_t probe;
+    bool ran;
+    uint32_t at_ms;
+    portENTER_CRITICAL(&s_job_lock);
+    result = s_probe_result;
+    probe = s_probe_req;
+    ran = s_probe_ran;
+    at_ms = s_probe_at_ms;
+    portEXIT_CRITICAL(&s_job_lock);
+
+    char json[640];
+    int n;
+    if (!ran) {
+        n = snprintf(json, sizeof(json), "{\"ok\":true,\"enabled\":%s,\"ran\":false}",
+                     screen_driver_partial_probe_enabled() ? "true" : "false");
+    } else {
+        n = snprintf(json, sizeof(json),
+            "{\"ok\":true,\"enabled\":%s,\"ran\":true,"
+            "\"x\":%d,\"y\":%d,\"w\":%d,\"h\":%d,\"repeat\":%u,\"mode\":\"%s\","
+            "\"write_ms\":%u,\"drf_ms\":%u,\"cleanup_ms\":%u,\"total_ms\":%u,"
+            "\"bytes\":%u,\"repeats\":%u,\"busy_asserted\":%s,\"busy_failures\":%u,"
+            "\"exit_partial\":%s,\"cleanup\":%s,\"rotation\":%u,"
+            "\"gate\":[%u,%u],\"row\":[%u,%u],\"panel\":[%d,%d,%d,%d],"
+            "\"err\":%d,\"err_name\":\"%s\",\"at_ms\":%u}",
+            screen_driver_partial_probe_enabled() ? "true" : "false",
+            probe.x, probe.y, probe.w, probe.h, (unsigned)probe.repeat,
+            probe_mode_name(probe.mode),
+            (unsigned)result.write_ms, (unsigned)result.drf_ms,
+            (unsigned)result.cleanup_ms, (unsigned)result.total_ms,
+            (unsigned)result.bytes, (unsigned)result.repeats_done,
+            result.busy_asserted ? "true" : "false", (unsigned)result.busy_failures,
+            result.exit_partial_ok ? "true" : "false", result.cleanup_ok ? "true" : "false",
+            (unsigned)result.rotation, (unsigned)result.gate_start, (unsigned)result.gate_end,
+            (unsigned)result.row_start, (unsigned)result.row_end,
+            result.px0, result.py0, result.px1, result.py1,
+            (int)result.err, esp_err_to_name(result.err), (unsigned)at_ms);
+    }
+    if (n < 0 || (size_t)n >= sizeof(json)) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "probe JSON overflow");
+        return ESP_FAIL;
+    }
+    return send_json(req, json);
+}
+
+static esp_err_t probe_post_handler(httpd_req_t *req)
+{
+    power_mgr_note_activity();
+    char body[192];
+    if (read_json_body(req, body, sizeof(body)) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "body size");
+        return ESP_FAIL;
+    }
+    cJSON *root = cJSON_ParseWithOpts(body, NULL, true);
+    bool valid = cJSON_IsObject(root);
+    const cJSON *jx = valid ? cJSON_GetObjectItemCaseSensitive(root, "x") : NULL;
+    const cJSON *jy = valid ? cJSON_GetObjectItemCaseSensitive(root, "y") : NULL;
+    const cJSON *jw = valid ? cJSON_GetObjectItemCaseSensitive(root, "w") : NULL;
+    const cJSON *jh = valid ? cJSON_GetObjectItemCaseSensitive(root, "h") : NULL;
+    const cJSON *jr = valid ? cJSON_GetObjectItemCaseSensitive(root, "repeat") : NULL;
+    const cJSON *jm = valid ? cJSON_GetObjectItemCaseSensitive(root, "mode") : NULL;
+
+    int x = 0, y = 0, w = 0, h = 0, repeat = 1;
+    screen_probe_mode_t mode = SCREEN_PROBE_MODE_REFRESH;
+    const cJSON *ints[] = { jx, jy, jw, jh };
+    int *values[] = { &x, &y, &w, &h };
+    for (size_t i = 0; i < sizeof(ints) / sizeof(ints[0]) && valid; ++i) {
+        valid = cJSON_IsNumber(ints[i]) &&
+                (double)ints[i]->valueint == ints[i]->valuedouble;
+        if (valid) *values[i] = ints[i]->valueint;
+    }
+    if (valid && jr) {
+        valid = cJSON_IsNumber(jr) && (double)jr->valueint == jr->valuedouble;
+        if (valid) repeat = jr->valueint;
+    }
+    if (valid && jm) {
+        if (cJSON_IsString(jm) && !strcmp(jm->valuestring, "write")) {
+            mode = SCREEN_PROBE_MODE_WRITE;
+        } else if (cJSON_IsString(jm) && !strcmp(jm->valuestring, "refresh")) {
+            mode = SCREEN_PROBE_MODE_REFRESH;
+        } else {
+            valid = false;
+        }
+    }
+    int logical_w = 0, logical_h = 0;
+    screen_rotation_size(screen_rotation_get(), &logical_w, &logical_h);
+    valid = valid && w >= 8 && h >= 8 && repeat >= 1 && repeat <= 10 &&
+            x >= 0 && y >= 0 && w <= logical_w && h <= logical_h &&
+            x <= logical_w - w && y <= logical_h - h;
+    const screen_probe_req_t probe = {
+        .x = x, .y = y, .w = w, .h = h,
+        .rotation = (uint16_t)screen_rotation_get(),
+        .repeat = (uint8_t)repeat, .mode = mode,
+    };
+    cJSON_Delete(root);
+    if (!valid) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                            "x,y,w,h inside rotation; w,h>=8; repeat 1..10; mode write|refresh");
+        return ESP_FAIL;
+    }
+    if (!screen_driver_partial_probe_enabled()) {
+        httpd_resp_set_status(req, "501 Not Implemented");
+        return send_json(req, "{\"ok\":false,\"error\":\"partial probe compiled out; "
+                              "build with SCREEN_PARTIAL_PROBE_ENABLE=1\"}");
+    }
+    if (web_server_screen_busy() || screen_rotation_busy() || !begin_job(JOB_PANEL_PROBE)) {
+        httpd_resp_set_status(req, "409 Conflict");
+        return send_json(req, "{\"ok\":false,\"error\":\"screen busy\"}");
+    }
+    portENTER_CRITICAL(&s_job_lock);
+    s_probe_req = probe;
+    portEXIT_CRITICAL(&s_job_lock);
+    set_job_phase(JOB_REFRESH, "probe");
+    xTaskNotifyGive(s_job_task);
+    httpd_resp_set_status(req, "202 Accepted");
+    return send_job_json(req);
+}
+
 esp_err_t web_server_start(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
-    config.max_uri_handlers = 20;
+    config.max_uri_handlers = 24;
     config.stack_size = 12288;
     config.max_open_sockets = 7;
     config.recv_wait_timeout = 5;
@@ -1255,6 +1431,8 @@ esp_err_t web_server_start(void)
         { .uri = "/api/frame", .method = HTTP_POST, .handler = frame_post_handler },
         { .uri = "/api/job", .method = HTTP_GET, .handler = job_get_handler },
         { .uri = "/api/panel", .method = HTTP_GET, .handler = panel_get_handler },
+        { .uri = "/api/panel/probe", .method = HTTP_GET, .handler = probe_get_handler },
+        { .uri = "/api/panel/probe", .method = HTTP_POST, .handler = probe_post_handler },
         { .uri = "/api/clear", .method = HTTP_POST, .handler = clear_post_handler },
         { .uri = "/api/slots", .method = HTTP_GET, .handler = slots_get_handler },
         { .uri = "/api/slot", .method = HTTP_GET, .handler = slot_get_handler },

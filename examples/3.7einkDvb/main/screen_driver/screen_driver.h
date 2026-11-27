@@ -65,4 +65,48 @@ esp_err_t screen_driver_upload(uint32_t expected_generation,
 esp_err_t screen_driver_clear(screen_upload_report_t *report);
 esp_err_t screen_driver_deep_sleep(void);
 
+/* ---- Partial-window bring-up probe (docs/panel_partial_probe.md) ---------- */
+/* The probe is compiled out by default because the 0x92 payload below is a
+ * JD/IST-family convention, not something derivable from this panel's full
+ * frame addressing. Build with -DSCREEN_PARTIAL_PROBE_ENABLE=1 to arm it. */
+#ifndef SCREEN_PARTIAL_PROBE_ENABLE
+#define SCREEN_PARTIAL_PROBE_ENABLE 0
+#endif
+
+typedef enum {
+    SCREEN_PROBE_MODE_WRITE = 0,   /* window RAM write only, no DRF */
+    SCREEN_PROBE_MODE_REFRESH = 1, /* window write followed by DRF */
+} screen_probe_mode_t;
+
+typedef struct {
+    int x, y, w, h;       /* logical coordinates in the current rotation */
+    uint16_t rotation;    /* 0/90/180/270, copied from screen_rotation_get() */
+    uint8_t repeat;       /* 1..10 passes over the same window */
+    screen_probe_mode_t mode;
+} screen_probe_req_t;
+
+typedef struct {
+    esp_err_t err;        /* first failure; ESP_OK means the whole probe ran */
+    uint32_t write_ms;    /* 0x10 + window bytes, all passes */
+    uint32_t drf_ms;      /* 0x12 + BUSY, all passes */
+    uint32_t cleanup_ms;  /* 0x90 + full white refresh */
+    uint32_t total_ms;    /* whole probe including cleanup */
+    uint32_t bytes;       /* window bytes per pass */
+    uint8_t repeats_done;
+    uint8_t busy_failures; /* DRFs that never pulled BUSY low */
+    bool busy_asserted;    /* at least one DRF pulled BUSY low */
+    bool exit_partial_ok;  /* 0x90 sent/acknowledged (true when nothing to exit) */
+    bool cleanup_ok;       /* full white refresh restored the glass */
+    uint16_t rotation;
+    uint16_t gate_start, gate_end; /* panel gate range, inclusive */
+    uint16_t row_start, row_end;   /* panel byte-row range, inclusive */
+    int16_t px0, py0, px1, py1;    /* panel pixel bounds before packing */
+} screen_probe_result_t;
+
+bool screen_driver_partial_probe_enabled(void);
+/* Runs under the display/SPI locks; caller holds the rotation lock and must
+ * not have the display busy. Always exits partial mode and repaints white. */
+esp_err_t screen_driver_partial_probe(const screen_probe_req_t *req,
+                                      screen_probe_result_t *out);
+
 #endif /* SCREEN_DRIVER_H */
