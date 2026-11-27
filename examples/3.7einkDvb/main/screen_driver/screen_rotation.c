@@ -21,6 +21,8 @@ static TaskHandle_t s_worker;
 static unsigned s_rotation = EINK_ROTATION;
 static uint32_t s_epoch = 1, s_pending;
 static bool s_working, s_ui_current;
+static bool s_content_current;
+static screen_content_redraw_cb_t s_content_redraw;
 static const esp_partition_t *s_partition;
 
 /* Three picture slots share the 1 MB image_cache partition: each slot keeps a
@@ -142,6 +144,7 @@ void screen_rotation_invalidate(void)
 {
     s_hidden = false;
     s_image_current = false;
+    s_content_current = false;
     s_capture.capturing = CAP_NONE;
     s_overlay_shown = false;
     __atomic_store_n(&s_source_generation, 0, __ATOMIC_RELEASE);
@@ -154,6 +157,7 @@ void screen_rotation_note_external(void)
     s_hidden = false;
     s_image_current = false;
     s_ui_current = false;
+    s_content_current = false;
     s_blank_current = false;
     s_capture.capturing = CAP_NONE;
     s_overlay_shown = false;
@@ -169,6 +173,7 @@ void screen_rotation_note_notice(void)
     s_hidden = false;
     s_image_current = false;
     s_ui_current = true;
+    s_content_current = false;
     s_blank_current = false;
     s_capture.capturing = CAP_NONE;
     s_overlay_shown = false;
@@ -176,6 +181,17 @@ void screen_rotation_note_notice(void)
 void screen_rotation_note_blank(void)
 {
     screen_rotation_invalidate(); s_ui_current = false; s_blank_current = true;
+}
+void screen_rotation_set_content_redraw(screen_content_redraw_cb_t cb)
+{
+    s_content_redraw = cb;
+}
+void screen_rotation_note_content(void)
+{
+    screen_rotation_invalidate();
+    s_content_current = true;
+    s_ui_current = false;
+    s_blank_current = false;
 }
 
 void screen_rotation_set_overlay(const char *text)
@@ -450,6 +466,11 @@ static esp_err_t replay_image(int index, unsigned target, bool overlay)
         s_slots[index].generation = report.display_generation;
         s_slot_current = index;
         s_image_current = true;
+        /* A picture now owns the glass: drop the firmware-page markers so a
+         * later blank/restore replays the picture, not an older notice/page. */
+        s_ui_current = false;
+        s_content_current = false;
+        s_blank_current = false;
         __atomic_store_n(&s_source_generation, report.display_generation, __ATOMIC_RELEASE);
         s_overlay_shown = r.overlay != NULL;
         snprintf(s_overlay_applied, sizeof(s_overlay_applied), "%s", r.overlay ? r.overlay : "");
@@ -488,7 +509,9 @@ esp_err_t screen_rotation_show_next(bool overlay)
     }
     if (index < 0) return ESP_ERR_INVALID_STATE;
     const bool shown = overlay && s_overlay[0];
-    if (index == s_slot_current && s_overlay_shown == shown &&
+    /* Only skip the refresh when that picture (and strip) is really on the
+     * glass; a firmware page also leaves s_slot_current pointing at it. */
+    if (s_image_current && index == s_slot_current && s_overlay_shown == shown &&
         strcmp(s_overlay_applied, shown ? s_overlay : "") == 0) return ESP_OK;
     ESP_LOGI(TAG, "next picture: slot %d -> %d strip=%d", s_slot_current, index, (int)shown);
     return replay_image(index, screen_rotation_get(), shown);
@@ -564,14 +587,24 @@ esp_err_t screen_rotation_read_frame(int index, size_t offset, uint8_t *buffer, 
 esp_err_t screen_rotation_toggle_blank(void)
 {
     if (screen_rotation_hidden()) {
-        esp_err_t err = s_ui_current ? screen_ui_redraw_rotation(screen_rotation_get()) :
-            s_slot_current >= 0 ? replay_image(s_slot_current, screen_rotation_get(), true) :
-            ESP_ERR_INVALID_STATE;
+        esp_err_t err;
+        if (s_content_current && s_content_redraw) {
+            /* The standby page owns the glass: restore it, not a picture. */
+            err = s_content_redraw(false) ? ESP_OK : ESP_FAIL;
+        } else if (s_ui_current) {
+            err = screen_ui_redraw_rotation(screen_rotation_get());
+        } else if (s_slot_current >= 0) {
+            err = replay_image(s_slot_current, screen_rotation_get(), true);
+        } else {
+            err = ESP_ERR_INVALID_STATE;
+        }
         if (err == ESP_OK) s_hidden = false;
         return err;
     }
     s_hidden = false;
-    if (!s_ui_current && (s_slot_current < 0 ||
+    /* The standby page is neither a picture nor a screen_ui page; it has no
+     * stored generation to compare, so accept it like a UI notice. */
+    if (!s_ui_current && !s_content_current && (s_slot_current < 0 ||
         s_slots[s_slot_current].generation != screen_driver_generation()))
         return ESP_ERR_INVALID_STATE;
     screen_upload_report_t report = {0};

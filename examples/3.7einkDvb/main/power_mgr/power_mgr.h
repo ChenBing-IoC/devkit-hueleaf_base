@@ -85,7 +85,9 @@
 
 /* Maintenance wake budget (timer wake, no AP): STA connect cap, SNTP wait and
  * the hard cap for the whole session. The session always ends in deep sleep,
- * so a stuck network cannot keep the radio on for long. */
+ * so a stuck network cannot keep the radio on for long. The cap has room for
+ * one full six-ink information-page refresh (about 23 s) on top of the network
+ * and TF-log work; an unchanged fingerprint skips the refresh entirely. */
 #ifndef POWER_MAINT_STA_MS
 #define POWER_MAINT_STA_MS 10000
 #endif
@@ -95,18 +97,19 @@
 #define POWER_MAINT_SNTP_MS 10000
 #endif
 #ifndef POWER_MAINT_TOTAL_MS
-#define POWER_MAINT_TOTAL_MS 45000
+#define POWER_MAINT_TOTAL_MS 120000
 #endif
 
-/* Picture cycle: the three uploaded slots rotate in order. Every awake period
- * shows the current picture with an address strip along the bottom; entering
- * low power drops the strip and draws the next picture, so the strip is the
- * awake marker. One full six-ink refresh happens per state change. */
+/* Picture cycle: three uploaded slots. Every awake period shows the current
+ * picture with an address strip along the bottom; BOOT or a gesture moves to
+ * the next one. Entering low power drops the strip and draws the standby
+ * information page; when that page is disabled it draws the next picture
+ * instead. One full six-ink refresh happens per state change. */
 
 typedef enum {
     POWER_STATE_ACTIVE = 0, /* radio on, web server reachable */
     POWER_STATE_LOW_POWER,  /* AP closed, MCU sleeping, waits for the key */
-    POWER_STATE_MAINTENANCE,/* timer wake: STA + clock only, no panel/AP */
+    POWER_STATE_MAINTENANCE,/* timer wake: STA + clock, optional page, no AP */
     POWER_STATE_OFF,        /* PMIC cut the rails */
 } power_mgr_state_t;
 
@@ -128,8 +131,8 @@ typedef struct {
  * network is up again. The owner redraws the network page from here. */
 typedef void (*power_mgr_wake_cb_t)(void);
 /* Runs inside a maintenance wake after the clock was set and before the device
- * goes back to sleep. The content pipeline (weather, calendar, ...) plugs in
- * here; it must not touch the panel itself. */
+ * goes back to sleep. The network content pipeline (weather, ...) plugs in
+ * here; it must not touch the panel itself, power_mgr owns the refresh. */
 typedef void (*power_mgr_maintenance_cb_t)(void);
 
 /* First call in app_main: loads the stored policy, probes the deep sleep wake
@@ -140,8 +143,9 @@ bool power_mgr_boot_maintenance(void);
 /* A latched PWRON press was found during a timer wake: treat the session as
  * interactive from now on. */
 void power_mgr_promote_wake(void);
-/* Timer wake body: STA only (no AP, no panel), SNTP -> PCF8563, wake task
- * hook, then deep sleep. Does not return. */
+/* Timer wake body: STA only (no AP), SNTP -> PCF8563, optional information
+ * page refresh when its fingerprint changed, TF log, then deep sleep. Does not
+ * return. */
 void power_mgr_maintenance_session(void);
 /* Arm the wake sources and enter deep sleep. Returns only on failure. */
 esp_err_t power_mgr_deep_sleep(void);

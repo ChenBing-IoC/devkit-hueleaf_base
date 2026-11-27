@@ -1,10 +1,13 @@
 #include "board.h"
+#include "content_page.h"
 #include "axp2101.h"
 #include "esp_attr.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
 #include "nfc_driver.h"
 #include "pcf8563.h"
 #include "msa321.h"
@@ -65,6 +68,16 @@ static void show_network_page(void)
     /* A deliberately blanked panel stays blank until the next key press. */
     if (screen_rotation_hidden()) {
         screen_rotation_unlock();
+        return;
+    }
+    /* With the standby page enabled it is the primary screen, awake included:
+     * it draws its own status line with the live address, so no picture and no
+     * driver overlay are needed. Pictures return only on BOOT or a gesture. */
+    content_config_t content_cfg;
+    if (content_config_get(&content_cfg) == ESP_OK && content_cfg.enabled) {
+        const bool drawn = content_page_redraw(true);
+        screen_rotation_unlock();
+        if (!drawn) ESP_LOGW(TAG, "content page + address failed");
         return;
     }
     /* Awake with a picture on the glass: the address strip is the awake marker.
@@ -150,6 +163,12 @@ static void on_lan_ready(void)
 void app_main(void)
 {
     ESP_LOGI(TAG, "Eink E6 3.7  ESP32-C5");
+
+    /* The standby information page, lunar calendar and countdown all use the
+     * local calendar date. China Standard Time is UTC+8 without DST; set this
+     * before the RTC restore so every localtime_r() call agrees. */
+    setenv("TZ", "CST-8", 1);
+    tzset();
 
     /* First: the stored sleep policy, the deep sleep wake pins and the reason
      * this boot happened decide between the interactive and the maintenance

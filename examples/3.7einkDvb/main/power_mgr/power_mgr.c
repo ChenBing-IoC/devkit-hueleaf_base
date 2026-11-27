@@ -5,6 +5,7 @@
 #include <sys/stat.h>
 #include <time.h>
 #include "axp2101.h"
+#include "content_page.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
 #include "esp_sleep.h"
@@ -19,6 +20,7 @@
 #include "nvs_flash.h"
 #include "pcf8563.h"
 #include "pin_map.h"
+#include "screen_driver.h"
 #include "screen_rotation.h"
 #include "screen_ui.h"
 #include "tf_card.h"
@@ -461,7 +463,7 @@ static bool maintenance_sntp(uint64_t budget_ms)
 }
 
 /* One CSV row per timer wake. Mounting and unmounting stay inside a 3 s budget
- * so a missing card never eats into the 45 s maintenance session. */
+ * so a missing card never eats into the 120 s maintenance session. */
 static void maintenance_log(void)
 {
     const int64_t start_us = esp_timer_get_time();
@@ -516,9 +518,11 @@ void power_mgr_maintenance_session(void)
     s_state = POWER_STATE_MAINTENANCE;
     s_low_power = true;
 
-    /* A scheduled wake never touches the panel: no AP, no address strip, no
-     * refresh. Only the clock and the battery are updated. */
-    ESP_LOGI(TAG, "maintenance wake: %u s budget, screen untouched",
+    /* A scheduled wake opens no AP and adds no address strip. It refreshes the
+     * standby information page at most once, and only when the fingerprint
+     * stored by the last draw differs, so an unchanged page costs no panel
+     * traffic at all. */
+    ESP_LOGI(TAG, "maintenance wake: %u s budget, content refresh on change",
              (unsigned)(POWER_MAINT_TOTAL_MS / 1000));
 
     esp_err_t err = wifi_mgr_sta_start(POWER_MAINT_STA_MS);
@@ -546,6 +550,27 @@ void power_mgr_maintenance_session(void)
             s_maint_cb();
         }
         (void)wifi_mgr_suspend();
+    }
+
+    /* Panel init is on demand: an unchanged page must not touch SPI, the image
+     * slots or the glass. The RTC still gives a usable local date when the
+     * network or SNTP failed, so the page is drawn in every case. */
+    content_config_t content_cfg;
+    if (content_config_get(&content_cfg) == ESP_OK && content_cfg.enabled &&
+        content_page_needs_redraw(false)) {
+        esp_err_t panel_err = screen_driver_init();
+        if (panel_err == ESP_OK) panel_err = screen_rotation_init();
+        if (panel_err != ESP_OK) {
+            ESP_LOGW(TAG, "content panel init: %s", esp_err_to_name(panel_err));
+        } else {
+            screen_rotation_lock();
+            const TickType_t started = xTaskGetTickCount();
+            const bool drawn = content_page_show(false);
+            screen_rotation_unlock();
+            ESP_LOGI(TAG, "content page %s (%u ms)",
+                     drawn ? "refreshed" : "unchanged",
+                     (unsigned)((xTaskGetTickCount() - started) * portTICK_PERIOD_MS));
+        }
     }
 
     /* Optional, best effort, and always after the clock had its chance. */
@@ -709,14 +734,19 @@ static void enter_low_power(void)
         ESP_LOGW(TAG, "suspending radio: %s", esp_err_to_name(err));
     }
 
-    /* The address strip marks the awake state, so it goes away first. Then the
-     * next stored picture replaces the one on the glass: one full six-ink
-     * refresh per idle entry, and the low power state is "a picture with no
-     * strip". Without pictures the firmware shows the low power notice. */
+    /* The address strip marks the awake state, so it goes away first. The
+     * standby information page then replaces whatever is on the glass: it is a
+     * firmware page and never consumes a picture slot. A disabled page falls
+     * back to the old picture cycle (or the low power notice when no picture
+     * has ever been stored). */
     screen_rotation_lock();
     screen_rotation_set_overlay(NULL);
+    content_config_t content_cfg;
+    (void)content_config_get(&content_cfg);
     if (screen_rotation_hidden()) {
         /* Deliberately blanked: nothing to draw, keep it that way. */
+    } else if (content_cfg.enabled && content_page_redraw(false)) {
+        /* Standby page is on the glass. */
     } else if (screen_rotation_has_images()) {
         esp_err_t swap = screen_rotation_show_next(false);
         if (swap != ESP_OK) ESP_LOGW(TAG, "idle picture: %s", esp_err_to_name(swap));

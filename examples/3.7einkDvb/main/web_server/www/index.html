@@ -721,6 +721,26 @@
       <p class="hint">{{ imuDetail }}</p>
       <p class="hint">拿起或翻面会切换到下一张缓存图片，双击同样换图；深睡运动唤醒取决于中断是否可用，不可用时仍由定时器或电源键唤醒。</p>
 
+      <div class="field" style="margin-top:18px">信息页</div>
+      <label>便签第一行
+        <input type="text" maxlength="32" v-model="contentNote0" :disabled="contentBusy || !contentReady" placeholder="英文/数字，最多 32 字符" />
+      </label>
+      <label>便签第二行
+        <input type="text" maxlength="32" v-model="contentNote1" :disabled="contentBusy || !contentReady" placeholder="可留空" />
+      </label>
+      <label>倒计时日期
+        <input type="date" v-model="contentDate" :disabled="contentBusy || !contentReady" />
+      </label>
+      <label>倒计时标签
+        <input type="text" maxlength="16" v-model="contentLabel" :disabled="contentBusy || !contentReady" placeholder="例如 TRIP" />
+      </label>
+      <label><input type="checkbox" v-model="contentEnabled" :disabled="contentBusy || !contentReady" /> 待机时显示信息页</label>
+      <button class="push" type="button" :disabled="contentBusy || !contentReady" @click="saveContent()">保存信息页设置</button>
+      <button class="push" type="button" :disabled="contentBusy || !contentReady" @click="refreshContentPage">立即刷新信息页（约 23 秒）</button>
+      <p class="hint">{{ contentDetail }}</p>
+      <p class="hint">醒着和待机都优先显示信息页：日期、最近刷新时间、农历与节气、倒计时和便签，醒着时状态行带 IP；BOOT 键仍切换到图片。定时唤醒只在内容（跨日、便签、倒计时、天气）变化时整屏刷新一次。</p>
+      <p class="status" :class="contentStatusClass" role="status" aria-live="polite">{{ contentStatus }}</p>
+
     </div>
 
     <div v-show="tab === 'text' || tab === 'image'" class="editor-layout">
@@ -1151,6 +1171,124 @@
           }
           imuFetchedAt = Date.now();
           imuInFlight = false;
+        };
+        /* 待机信息页：配置与手动刷新，接口见 /api/content。 */
+        const contentEnabled = ref(true);
+        const contentNote0 = ref('');
+        const contentNote1 = ref('');
+        const contentDate = ref('');
+        const contentLabel = ref('');
+        const contentReady = ref(false);
+        const contentBusy = ref(false);
+        const contentStatus = ref('');
+        const contentStatusClass = ref('');
+        const contentDetail = ref('正在读取信息页配置');
+        const applyContentInfo = (info, saved = false) => {
+          if (saved || !contentReady.value) {
+            contentEnabled.value = !!info.enabled;
+            contentNote0.value = (info.note && info.note[0]) || '';
+            contentNote1.value = (info.note && info.note[1]) || '';
+            contentDate.value = info.countdown_date || '';
+            contentLabel.value = info.countdown_label || '';
+          }
+          contentReady.value = true;
+          const when = info.last_draw
+            ? new Date(info.last_draw * 1000).toLocaleString()
+            : '尚未绘制';
+          contentDetail.value = '最近绘制：' + when +
+            (info.last_fingerprint ? ' · 指纹 ' + info.last_fingerprint : '') +
+            (info.refreshed ? ' · 本次已刷新' : '');
+        };
+        let contentInFlight = false;
+        const refreshContent = async () => {
+          if (contentInFlight || contentBusy.value) return;
+          contentInFlight = true;
+          try {
+            const info = await fetchJson('/api/content', { cache: 'no-store' }, 5000);
+            if (info.ok) applyContentInfo(info);
+          } catch (_) {
+            contentDetail.value = '信息页配置离线';
+          }
+          contentInFlight = false;
+        };
+        const contentTextOk = (v, max) =>
+          v.length <= max && /^[\x20-\x7e]*$/.test(v) && !/[\\"]/.test(v);
+        const validateContentForm = () => {
+          if (!contentTextOk(contentNote0.value, 32) || !contentTextOk(contentNote1.value, 32) ||
+              !contentTextOk(contentLabel.value, 16)) {
+            contentStatus.value = '只支持英文、数字和常见符号；便签最多 32 字符，标签最多 16 字符';
+            contentStatusClass.value = 'err';
+            return false;
+          }
+          if (contentDate.value && !/^\d{4}-\d{2}-\d{2}$/.test(contentDate.value)) {
+            contentStatus.value = '倒计时日期格式应为 YYYY-MM-DD';
+            contentStatusClass.value = 'err';
+            return false;
+          }
+          if (contentDate.value) {
+            const year = Number(contentDate.value.slice(0, 4));
+            if (year < 1900 || year > 2100) {
+              contentStatus.value = '倒计时日期需在 1900–2100 之间';
+              contentStatusClass.value = 'err';
+              return false;
+            }
+          }
+          return true;
+        };
+        const contentBody = () => ({
+          enabled: contentEnabled.value,
+          note: [contentNote0.value, contentNote1.value],
+          countdown_date: contentDate.value,
+          countdown_label: contentLabel.value,
+        });
+        const postContent = async () => {
+          const info = await fetchJson('/api/content', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(contentBody()),
+          });
+          applyContentInfo(info, true);
+          return info;
+        };
+        const saveContent = async () => {
+          if (contentBusy.value || !contentReady.value) return;
+          if (!validateContentForm()) return;
+          contentBusy.value = true;
+          contentStatusClass.value = '';
+          contentStatus.value = '正在保存';
+          try {
+            await postContent();
+            contentStatus.value = '信息页设置已保存';
+            contentStatusClass.value = 'ok';
+          } catch (e) {
+            contentStatus.value = '保存失败，请重试';
+            contentStatusClass.value = 'err';
+          }
+          contentBusy.value = false;
+        };
+        const refreshContentPage = async () => {
+          if (contentBusy.value || !contentReady.value) return;
+          if (!validateContentForm()) return;
+          contentBusy.value = true;
+          contentStatusClass.value = '';
+          contentStatus.value = '正在保存并刷新（约 23 秒）';
+          try {
+            await postContent();
+            const res = await fetch('/api/content/refresh', { method: 'POST' });
+            const job = await res.json().catch(() => null);
+            if (!job || job.ok === false) throw new Error((job && job.error) || ('HTTP ' + res.status));
+            if (!Number.isInteger(job.id)) throw new Error('设备协议不匹配');
+            const done = await pollTfJob(job.id, 60000);
+            if (done.kind !== 'content' || done.err !== 0) throw new Error('刷新完成凭据不匹配');
+            const info = await fetchJson('/api/content', { cache: 'no-store' }, 5000);
+            if (info.ok) applyContentInfo(info);
+            contentStatus.value = '信息页已刷新';
+            contentStatusClass.value = 'ok';
+          } catch (e) {
+            contentStatus.value = '刷新失败：' + (e.message || e);
+            contentStatusClass.value = 'err';
+          }
+          contentBusy.value = false;
         };
         const text = ref('你好，Eink');
         const bg = ref(0x1);
@@ -1732,7 +1870,7 @@
           clearTimeout(ditherTimer);
           previewBusy.value = false;
           tab.value = t;
-          if (t === 'settings') refreshImu();
+          if (t === 'settings') { refreshImu(); refreshContent(); }
           else if (t === 'image') refreshTf();
           nextTick(() => {
             if (t === 'text') renderText();
@@ -2102,7 +2240,9 @@
           wifiMode, wifiSsid, wifiUrl, wifiList, selectedSsid, wifiPass, wifiBusy, wifiStatus, wifiStatusClass,
           chargeCapacity, chargeDirty, chargeReady, chargeDetail, gaugeDetail, chargePower, chargeBusy, chargeStatus, chargeStatusClass, chargeLevels,
           powerMode, powerInterval, powerDirty, powerReady, powerBusy, powerStatus, powerStatusClass, powerDetail, imuDetail,
-          wakeIntervals, sleepModes, savePower,
+          contentEnabled, contentNote0, contentNote1, contentDate, contentLabel,
+          contentReady, contentBusy, contentStatus, contentStatusClass, contentDetail,
+          wakeIntervals, sleepModes, savePower, saveContent, refreshContentPage,
           switchTab, renderText, onFileChange, onDrop, push, setQuant, setDitherQuality, setRenderStyle,
           clearDisplay,
           lastPanelFrame, regionUpdate, forceRefresh, updateRect, canRegionUpdate, setRegionUpdate,

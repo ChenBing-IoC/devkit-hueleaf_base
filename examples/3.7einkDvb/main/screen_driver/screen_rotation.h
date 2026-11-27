@@ -40,6 +40,13 @@ void screen_rotation_note_blank(void);
 /* A transient firmware notice (low power page) replaced the content on the
  * glass; the cached slots stay valid so it can be replayed later. */
 void screen_rotation_note_notice(void);
+/* The standby information page is a firmware page like a notice, but the
+ * power key blank/restore path must redraw it instead of a picture. The
+ * content module registers its redraw callback and marks the page current
+ * after a successful refresh. The callback runs with the rotation lock held. */
+typedef bool (*screen_content_redraw_cb_t)(bool with_status);
+void screen_rotation_set_content_redraw(screen_content_redraw_cb_t cb);
+void screen_rotation_note_content(void);
 bool screen_rotation_has_images(void);
 unsigned screen_rotation_image_count(void);
 int screen_rotation_current(void);

@@ -1,4 +1,6 @@
 #include "cJSON.h"
+#include "content_page.h"
+#include "lunar.h"
 #include "web_server.h"
 #include "pin_map.h"
 #include "power_mgr.h"
@@ -32,7 +34,8 @@ static const char *TAG = "web";
 
 typedef enum { JOB_IDLE, JOB_REFRESH, JOB_RECEIVING, JOB_ERROR } job_phase_t;
 typedef enum {
-    JOB_FRAME, JOB_CLEAR_SCREEN, JOB_TF_IMPORT, JOB_TF_EXPORT, JOB_PANEL_PROBE
+    JOB_FRAME, JOB_CLEAR_SCREEN, JOB_TF_IMPORT, JOB_TF_EXPORT, JOB_PANEL_PROBE,
+    JOB_CONTENT
 } job_kind_t;
 #define FRAME_FORMAT "otp6-v1"
 #define FRAME_CHUNK_BYTES 2048
@@ -96,6 +99,7 @@ static const char *job_kind_name(job_kind_t kind)
     case JOB_TF_IMPORT: return "tf-import";
     case JOB_TF_EXPORT: return "tf-export";
     case JOB_PANEL_PROBE: return "panel-probe";
+    case JOB_CONTENT: return "content";
     default: return "frame";
     }
 }
@@ -106,6 +110,7 @@ static const char *job_sequence(job_kind_t kind)
     case JOB_TF_IMPORT: return "tf-import-v1";
     case JOB_TF_EXPORT: return "tf-export-v1";
     case JOB_PANEL_PROBE: return "panel-probe-v1";
+    case JOB_CONTENT: return "content-page-v1";
     default: return FRAME_FORMAT;
     }
 }
@@ -1006,6 +1011,23 @@ static void frame_job_task(void *arg)
             ESP_LOGI(TAG, "job panel-probe %s", esp_err_to_name(probe_err));
             continue;
         }
+        if (kind == JOB_CONTENT) {
+            screen_upload_report_t content_report = {0};
+            const TickType_t content_started = xTaskGetTickCount();
+            screen_rotation_lock();
+            const bool drawn = content_page_redraw(true);
+            screen_rotation_unlock();
+            content_report.total_ms = (uint32_t)((xTaskGetTickCount() - content_started) *
+                                                 portTICK_PERIOD_MS);
+            content_report.refresh_ms = content_report.total_ms;
+            content_report.completed = drawn;
+            content_report.display_generation = screen_driver_generation();
+            finish_job(drawn ? ESP_OK : ESP_FAIL, &content_report);
+            ESP_LOGI(TAG, "job content %s (%u ms)",
+                     esp_err_to_name(drawn ? ESP_OK : ESP_FAIL),
+                     (unsigned)content_report.total_ms);
+            continue;
+        }
         if (kind == JOB_TF_IMPORT || kind == JOB_TF_EXPORT) {
             const tf_pending_t tf = s_tf_pending;
             screen_upload_report_t tf_report = {0};
@@ -1268,6 +1290,126 @@ static esp_err_t imu_get_handler(httpd_req_t *req)
     return send_json(req, json);
 }
 
+/* ---- Standby information page -------------------------------------------- */
+
+static esp_err_t send_content_json(httpd_req_t *req)
+{
+    content_config_t cfg;
+    (void)content_config_get(&cfg);
+    content_status_t status;
+    content_status_get(&status);
+
+    char json[512];
+    const int used = snprintf(json, sizeof(json),
+        "{\"ok\":true,\"enabled\":%s,\"note\":[\"%.32s\",\"%.32s\"],"
+        "\"countdown_date\":\"%.10s\",\"countdown_label\":\"%.16s\","
+        "\"last_draw\":%u,\"last_fingerprint\":\"%08x\",\"refreshed\":%s}",
+        cfg.enabled ? "true" : "false", cfg.note[0], cfg.note[1],
+        cfg.countdown_date, cfg.countdown_label,
+        (unsigned)status.drawn_at, (unsigned)status.fingerprint,
+        status.refreshed ? "true" : "false");
+    if (used < 0 || (size_t)used >= sizeof(json)) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "content JSON overflow");
+        return ESP_FAIL;
+    }
+    return send_json(req, json);
+}
+
+static esp_err_t content_get_handler(httpd_req_t *req)
+{
+    return send_content_json(req);
+}
+
+static esp_err_t content_post_handler(httpd_req_t *req)
+{
+    power_mgr_note_activity();
+    char body[384];
+    if (read_json_body(req, body, sizeof(body)) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "body size");
+        return ESP_FAIL;
+    }
+    content_config_t cfg;
+    (void)content_config_get(&cfg); /* defaults are usable if NVS is damaged */
+
+    cJSON *root = cJSON_ParseWithOpts(body, NULL, true);
+    bool valid = cJSON_IsObject(root);
+
+    const cJSON *enabled = cJSON_GetObjectItemCaseSensitive(root, "enabled");
+    if (enabled) {
+        valid = valid && cJSON_IsBool(enabled);
+        if (valid) cfg.enabled = cJSON_IsTrue(enabled);
+    }
+
+    const cJSON *notes = cJSON_GetObjectItemCaseSensitive(root, "note");
+    if (notes) {
+        if (!cJSON_IsArray(notes) || cJSON_GetArraySize(notes) > CONTENT_NOTE_LINES) {
+            valid = false;
+        } else {
+            cfg.note[0][0] = '\0';
+            cfg.note[1][0] = '\0';
+            int index = 0;
+            for (const cJSON *item = notes->child; item && valid; item = item->next) {
+                if (!cJSON_IsString(item) ||
+                    !content_config_note_ok(item->valuestring, CONTENT_NOTE_MAX)) {
+                    valid = false;
+                    break;
+                }
+                const size_t length = strlen(item->valuestring);
+                memcpy(cfg.note[index], item->valuestring, length + 1);
+                ++index;
+            }
+        }
+    }
+
+    const cJSON *date = cJSON_GetObjectItemCaseSensitive(root, "countdown_date");
+    if (date) {
+        valid = valid && cJSON_IsString(date) &&
+                strlen(date->valuestring) <= CONTENT_DATE_MAX &&
+                (date->valuestring[0] == '\0' ||
+                 lunar_parse_date(date->valuestring, NULL, NULL, NULL));
+        if (valid) strlcpy(cfg.countdown_date, date->valuestring, sizeof(cfg.countdown_date));
+    }
+
+    const cJSON *label = cJSON_GetObjectItemCaseSensitive(root, "countdown_label");
+    if (label) {
+        valid = valid && cJSON_IsString(label) &&
+                content_config_note_ok(label->valuestring, CONTENT_LABEL_MAX);
+        if (valid) strlcpy(cfg.countdown_label, label->valuestring,
+                           sizeof(cfg.countdown_label));
+    }
+    cJSON_Delete(root);
+    if (!valid) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                            "enabled, note[2] (32 ASCII), countdown_date, label (16 ASCII)");
+        return ESP_FAIL;
+    }
+    const esp_err_t err = content_config_set(&cfg);
+    if (err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, esp_err_to_name(err));
+        return ESP_FAIL;
+    }
+    return send_content_json(req);
+}
+
+/* A manual redraw always costs one full refresh. The job task owns the
+ * rotation lock; HTTP only queues it and returns 202. */
+static esp_err_t content_refresh_post_handler(httpd_req_t *req)
+{
+    power_mgr_note_activity();
+    if (req->content_len != 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "expected empty body");
+        return ESP_FAIL;
+    }
+    if (web_server_screen_busy() || screen_rotation_busy() || !begin_job(JOB_CONTENT)) {
+        httpd_resp_set_status(req, "409 Conflict");
+        return send_json(req, "{\"ok\":false,\"error\":\"screen busy\"}");
+    }
+    set_job_phase(JOB_REFRESH, "content");
+    xTaskNotifyGive(s_job_task);
+    httpd_resp_set_status(req, "202 Accepted");
+    return send_job_json(req);
+}
+
 /* ---- Partial-window probe API (docs/panel_partial_probe.md) -------------- */
 
 static const char *probe_mode_name(screen_probe_mode_t mode)
@@ -1399,7 +1541,7 @@ esp_err_t web_server_start(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
-    config.max_uri_handlers = 24;
+    config.max_uri_handlers = 28;
     config.stack_size = 12288;
     config.max_open_sockets = 7;
     config.recv_wait_timeout = 5;
@@ -1437,6 +1579,9 @@ esp_err_t web_server_start(void)
         { .uri = "/api/slots", .method = HTTP_GET, .handler = slots_get_handler },
         { .uri = "/api/slot", .method = HTTP_GET, .handler = slot_get_handler },
         { .uri = "/api/imu", .method = HTTP_GET, .handler = imu_get_handler },
+        { .uri = "/api/content", .method = HTTP_GET, .handler = content_get_handler },
+        { .uri = "/api/content", .method = HTTP_POST, .handler = content_post_handler },
+        { .uri = "/api/content/refresh", .method = HTTP_POST, .handler = content_refresh_post_handler },
         { .uri = "/api/tf", .method = HTTP_GET, .handler = tf_get_handler },
         { .uri = "/api/tf/import", .method = HTTP_POST, .handler = tf_import_post_handler },
         { .uri = "/api/tf/export", .method = HTTP_POST, .handler = tf_export_post_handler },
