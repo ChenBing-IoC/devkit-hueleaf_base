@@ -6,22 +6,24 @@
 
 探针是一条独立的 bring-up 路径，不改变正常传图、清屏、TF 导入导出的行为。
 
-## 1. 为什么默认关闭
+## 1. 编译开关与触发方式
 
 驱动现有代码只证明了整屏寻址：帧按 gate 排列（gate = 479 − x），每字节两个
 纵向像素（行号 = y / 2）。`0x91 / 0x92 / 0x90` 这组 JD/IST 局部窗口命令在
-本仓库里从未使用过，`0x92` 的 9 字节参数顺序也无法从现有整屏代码推断。
-因此探针默认在编译期关闭：
+本仓库里从未使用过，`0x92` 的 9 字节参数顺序也无法从现有整屏代码推断，
+所以探针由一个编译期开关控制（当前默认开启）：
 
 ```c
 /* main/screen_driver/screen_driver.h */
 #ifndef SCREEN_PARTIAL_PROBE_ENABLE
-#define SCREEN_PARTIAL_PROBE_ENABLE 0
+#define SCREEN_PARTIAL_PROBE_ENABLE 1
 #endif
 ```
 
-确认风险后再打开（或临时在编译参数里加 `-DSCREEN_PARTIAL_PROBE_ENABLE=1`），
-重新构建烧录。未打开时 `POST /api/panel/probe` 返回 `501 Not Implemented`。
+编译进去也不会自己运行：只有显式 `POST /api/panel/probe` 才会入队——手机或
+电脑打开设备网页，在「设置」页的「屏幕诊断」里点「运行局部刷新探针」即可，
+也可以用下面的 curl。作业结束后探针一定退出局部模式并做一次整屏白刷。
+把宏改回 0 可以把它从固件里完全去掉，此时接口返回 `501 Not Implemented`。
 
 ## 2. 调用方法
 

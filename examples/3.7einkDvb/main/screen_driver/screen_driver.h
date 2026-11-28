@@ -70,7 +70,7 @@ esp_err_t screen_driver_deep_sleep(void);
  * JD/IST-family convention, not something derivable from this panel's full
  * frame addressing. Build with -DSCREEN_PARTIAL_PROBE_ENABLE=1 to arm it. */
 #ifndef SCREEN_PARTIAL_PROBE_ENABLE
-#define SCREEN_PARTIAL_PROBE_ENABLE 0
+#define SCREEN_PARTIAL_PROBE_ENABLE 1
 #endif
 
 typedef enum {

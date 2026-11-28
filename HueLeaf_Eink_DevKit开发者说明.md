@@ -79,7 +79,7 @@ SPI 主机为 SPI2。板级代码将共享总线访问串行化；自行添加 S
 
 帧数据为列优先打包，发送前必须遵守驱动声明的排列与半字节顺序。不能将常见的行优先 4-bit 位图直接当作屏幕帧上传。面板初始化与刷新波形按当前板载屏幕 profile 使用 OTP 流程；不要将其他控制器或面板的初始化序列、LUT 和电气参数直接套用。
 
-驱动另外内置一个仅用于可行性验证的局部窗口探针（`screen_driver_partial_probe()`）：按 `0x91` partial in → `0x92` 9 字节窗口 → `0x10` 窗口数据 → `0x12` DRF → `0x90` partial out 的顺序，在指定逻辑窗口填充纯红，并记录写入、DRF BUSY 和清理耗时；任何一步失败都会退出局部模式并整屏白刷恢复。由于 `0x92` 的 9 字节参数顺序无法从现有整屏寻址推断，该探针由 `SCREEN_PARTIAL_PROBE_ENABLE` 在编译期默认关闭；开启后用 `POST /api/panel/probe` 入队、`GET /api/panel/probe` 读取最近结果。探针走作业任务并持 rotation 锁，不影响正常传图路径，调用与判读方法见 `docs/panel_partial_probe.md`。
+驱动另外内置一个仅用于可行性验证的局部窗口探针（`screen_driver_partial_probe()`）：按 `0x91` partial in → `0x92` 9 字节窗口 → `0x10` 窗口数据 → `0x12` DRF → `0x90` partial out 的顺序，在指定逻辑窗口填充纯红，并记录写入、DRF BUSY 和清理耗时；任何一步失败都会退出局部模式并整屏白刷恢复。由于 `0x92` 的 9 字节参数顺序无法从现有整屏寻址推断，该探针由 `SCREEN_PARTIAL_PROBE_ENABLE` 控制（当前默认 1）；它只在显式 `POST /api/panel/probe` 时入队——网页「设置」页的「屏幕诊断」按钮就是这个接口，也可用 curl；`GET /api/panel/probe` 读取最近结果。探针走作业任务并持 rotation 锁，不影响正常传图路径，调用与判读方法见 `docs/panel_partial_probe.md`。
 
 图像渲染全部在浏览器端完成：`eink_pipeline.js` 将裁剪图转换到 OKLab，以感知色差选择墨色，再做蛇形 Floyd–Steinberg 误差扩散。`photo` 风格会在扩散前做阴影提亮、高光压缩和轻微饱和度提升，`illustration` 更接近原色，`flat` 则直接取最近墨色（用于文字和图标）。选墨与误差扩散都在 OKLab 中计算：在 sRGB 或线性 RGB 距离下，中性灰会被判成蓝色或绿色，这是旧版渲染发灰、发绿并出现彩色噪点的主要原因；低彩度像素现在只允许黑、白两色参与扩散。固件仍然只接收最终打包好的 4-bit 色号帧，不参与任何图像运算。
 
