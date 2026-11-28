@@ -11,19 +11,20 @@
 驱动现有代码只证明了整屏寻址：帧按 gate 排列（gate = 479 − x），每字节两个
 纵向像素（行号 = y / 2）。`0x91 / 0x92 / 0x90` 这组 JD/IST 局部窗口命令在
 本仓库里从未使用过，`0x92` 的 9 字节参数顺序也无法从现有整屏代码推断，
-所以探针由一个编译期开关控制（当前默认开启）：
+所以探针由一个编译期开关控制，默认关闭（2026-11-28 的实测已经完成，结论见
+第 7 节；当时为了方便手机操作曾临时在网页里加过「屏幕诊断」按钮，得出
+结论后已移除）：
 
 ```c
 /* main/screen_driver/screen_driver.h */
 #ifndef SCREEN_PARTIAL_PROBE_ENABLE
-#define SCREEN_PARTIAL_PROBE_ENABLE 1
+#define SCREEN_PARTIAL_PROBE_ENABLE 0
 #endif
 ```
 
-编译进去也不会自己运行：只有显式 `POST /api/panel/probe` 才会入队——手机或
-电脑打开设备网页，在「设置」页的「屏幕诊断」里点「运行局部刷新探针」即可，
-也可以用下面的 curl。作业结束后探针一定退出局部模式并做一次整屏白刷。
-把宏改回 0 可以把它从固件里完全去掉，此时接口返回 `501 Not Implemented`。
+需要复跑时把宏设为 1 重新构建，然后显式 `POST /api/panel/probe` 才会入队
+（下面的 curl，或手机上的任意 HTTP 客户端）。作业结束后探针一定退出局部
+模式并做一次整屏白刷。宏为 0 时接口返回 `501 Not Implemented`。
 
 ## 2. 调用方法
 

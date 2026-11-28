@@ -793,29 +793,6 @@
       <p class="hint">{{ weatherDetail }}</p>
       <p class="hint">来源 Open-Meteo（免 API key，需联网）。设备只发送经纬度，不带任何标识；抓取失败会保留上次数据并记录错误，不会阻塞深睡。</p>
       <p class="status" :class="weatherStatusClass" role="status" aria-live="polite">{{ weatherStatus }}</p>
-      <div class="field" style="margin-top:18px">屏幕诊断</div>
-      <div style="display:flex;gap:8px">
-        <label style="flex:1">x<input type="number" min="0" v-model.number="probeX" :disabled="probeBusy" /></label>
-        <label style="flex:1">y<input type="number" min="0" v-model.number="probeY" :disabled="probeBusy" /></label>
-        <label style="flex:1">w<input type="number" min="8" v-model.number="probeW" :disabled="probeBusy" /></label>
-        <label style="flex:1">h<input type="number" min="8" v-model.number="probeH" :disabled="probeBusy" /></label>
-      </div>
-      <label>重复次数
-        <select v-model.number="probeRepeat" :disabled="probeBusy">
-          <option :value="1">1</option><option :value="3">3</option><option :value="5">5</option>
-        </select>
-      </label>
-      <label>模式
-        <select v-model="probeMode" :disabled="probeBusy">
-          <option value="refresh">写入 + 刷新</option>
-          <option value="write">只写窗口（不刷新）</option>
-        </select>
-      </label>
-      <button class="push" type="button" :disabled="probeBusy" @click="runProbe">运行局部刷新探针（约 90 秒）</button>
-      <button class="push" type="button" :disabled="probeBusy" @click="refreshProbeInfo">读取最近结果</button>
-      <p class="hint">{{ probeDetail }}</p>
-      <p class="hint">探针需要固件在 screen_driver.h 里把 SCREEN_PARTIAL_PROBE_ENABLE 设为 1；未启用时接口返回 501。运行期间屏幕会依次出现红块、白屏、原图，不要断电。</p>
-      <p class="status" :class="probeStatusClass" role="status" aria-live="polite">{{ probeStatus }}</p>
 
     </div>
 
@@ -1599,65 +1576,6 @@
           }
           weatherBusy.value = false;
         };
-
-        /* 屏幕诊断：局部刷新探针，走作业系统与 /api/job 轮询。 */
-        const probeX = ref(0), probeY = ref(0), probeW = ref(240), probeH = ref(80);
-        const probeRepeat = ref(1), probeMode = ref('refresh');
-        const probeBusy = ref(false), probeStatus = ref(''), probeStatusClass = ref('');
-        const probeDetail = ref('尚未运行');
-        const applyProbeInfo = (info) => {
-          if (!info) return;
-          if (info.enabled === false) {
-            probeDetail.value = '探针未编译进固件（SCREEN_PARTIAL_PROBE_ENABLE = 0）';
-            return;
-          }
-          if (!info.ran) { probeDetail.value = '尚未运行'; return; }
-          probeDetail.value = '最近一次 ' + info.x + ',' + info.y + ' ' + info.w + 'x' + info.h +
-            ' · write ' + info.write_ms + ' ms · drf ' + info.drf_ms + ' ms · cleanup ' +
-            info.cleanup_ms + ' ms · busy ' + (info.busy_asserted ? 'yes' : 'no') +
-            ' · err ' + (info.err_name || info.err);
-        };
-        const refreshProbeInfo = async () => {
-          try {
-            const info = await fetchJson('/api/panel/probe', { cache: 'no-store' }, 5000);
-            if (info.ok) applyProbeInfo(info);
-          } catch (_) {
-            probeDetail.value = '读取探针状态失败';
-          }
-        };
-        const runProbe = async () => {
-          if (probeBusy.value) return;
-          const x = Number(probeX.value), y = Number(probeY.value);
-          const w = Number(probeW.value), h = Number(probeH.value);
-          if (![x, y, w, h].every(Number.isInteger) || x < 0 || y < 0 || w < 8 || h < 8) {
-            probeStatus.value = '窗口不合法：x/y 不能为负，w/h 至少 8';
-            probeStatusClass.value = 'err';
-            return;
-          }
-          probeBusy.value = true;
-          probeStatusClass.value = '';
-          probeStatus.value = '探针运行中，约 90 秒（红块 → 白屏 → 原图）';
-          try {
-            const res = await apiFetch('/api/panel/probe', {
-              method: 'POST', headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ x, y, w, h, repeat: probeRepeat.value, mode: probeMode.value }),
-            });
-            if (res.status === 501) throw new Error('探针未编译进固件，请先把 SCREEN_PARTIAL_PROBE_ENABLE 设为 1');
-            if (res.status === 409) throw new Error('屏幕忙，稍后再试');
-            const job = await res.json().catch(() => null);
-            if (!job || job.ok === false) throw new Error((job && job.error) || ('HTTP ' + res.status));
-            if (!Number.isInteger(job.id)) throw new Error('设备协议不匹配');
-            const done = await pollTfJob(job.id, 180000);
-            if (done.kind !== 'panel-probe') throw new Error('完成凭据不匹配');
-            probeStatus.value = '探针完成';
-            probeStatusClass.value = 'ok';
-          } catch (e) {
-            probeStatus.value = '探针失败：' + (e.message || e);
-            probeStatusClass.value = 'err';
-          }
-          await refreshProbeInfo();
-          probeBusy.value = false;
-        };
         const fetchWeatherNow = async () => {
           if (weatherBusy.value || !weatherReady.value) return;
           if (!validateWeatherForm()) return;
@@ -2272,7 +2190,7 @@
           clearTimeout(ditherTimer);
           previewBusy.value = false;
           tab.value = t;
-          if (t === 'settings') { refreshImu(); refreshContent(); refreshWeather(); refreshProbeInfo(); }
+          if (t === 'settings') { refreshImu(); refreshContent(); refreshWeather(); }
           else if (t === 'image') refreshTf();
           nextTick(() => {
             if (t === 'text') renderText();
@@ -2653,7 +2571,6 @@
           contentReady, contentBusy, contentStatus, contentStatusClass, contentDetail,
           weatherLat, weatherLon, weatherLabel, weatherEnabled, weatherReady, weatherBusy,
           weatherStatus, weatherStatusClass, weatherDetail, saveWeather, fetchWeatherNow, refreshWeather,
-          probeX, probeY, probeW, probeH, probeRepeat, probeMode, probeBusy, probeStatus, probeStatusClass, probeDetail, runProbe, refreshProbeInfo,
           wakeIntervals, sleepModes, savePower, saveContent, refreshContentPage,
           switchTab, renderText, onFileChange, onDrop, push, setQuant, setDitherQuality, setRenderStyle,
           clearDisplay,
