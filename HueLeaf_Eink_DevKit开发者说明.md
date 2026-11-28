@@ -57,7 +57,7 @@ SPI 主机为 SPI2。板级代码将共享总线访问串行化；自行添加 S
 
 | 信号 | GPIO | 说明 |
 | --- | --- | --- |
-| IMU_IRQ | GPIO4 | MSA321 INT1 直连 C5 GPIO4；GPIO4 在 LP 域，可作深睡唤醒源。中断寄存器表待手册核对，当前固件只轮询、不配置该中断 |
+| IMU_IRQ | GPIO4 | MSA321 INT1 直连 C5 GPIO4；GPIO4 在 LP 域，可作深睡唤醒源。固件配置 any-motion（active）中断：三轴使能（0x16 bit2:0）、映射 INT1（0x19 bit2）、推挽高有效（0x20 = 0x01）、锁存（0x21 LATCH_INT = 0111）；阈值 0x28 默认 `0x14`（156 mg，4 g 下 7.81 mg/LSB），时长 0x27 默认 `1`（2 ms），由 `MSA321_ACTIVE_TH` / `MSA321_ACTIVE_DUR` 宏调整。GPIO4 内部偏置改为下拉（板级初始化时为上拉，推挽高有效下上拉会持续灌电流且掉电时浮空成高电平） |
 | PMIC_IRQ | GPIO25 | AXP2101 nIRQ，低有效，下降沿通知任务 |
 | RTC_IRQ | GPIO23 | PCF8563 中断网络；当前固件将其配置为输入 |
 | 画面按键 | GPIO28 | 低电平按下，内部上拉；唤醒状态下切换到下一张缓存图片（带 IP 小字），并重新开始 2 分钟 Wi-Fi 计时 |
@@ -121,7 +121,7 @@ SPI 主机为 SPI2。板级代码将共享总线访问串行化；自行添加 S
 - 热点客户端数量由 `wifi_mgr` 统计（`WIFI_EVENT_AP_STACONNECTED` / `STADISCONNECTED`），数量大于 0 时 `power_mgr` 持续刷新活动时间戳，因此不会进入低功耗；断开后重新开始计时，符合「AP 有客户端时不休眠」的约定。
 - 唤醒后调用 `wifi_mgr_resume()`：有保存的 STA 凭据时先尝试连接路由器（12 秒），失败则重新打开配网热点；屏幕由 `main.c` 的 `screen_task` 重绘网络页。
 - 唤醒原因在 `app_main` 一开始由 `power_mgr_boot_init()` 分类：`ESP_SLEEP_WAKEUP_TIMER` 走维护会话；`EXT1`、`GPIO` 或上电、复位走交互会话。`ESP_SLEEP_WAKEUP_GPIO` 且 `esp_sleep_get_gpio_wakeup_status()` 掩码含 GPIO4 时日志记为 `motion wake`，同样按交互会话处理（开 AP、加 IP 小字、重新 2 分钟计时）。定时唤醒后第一时间读 AXP2101 短按状态，若睡眠期间按过电源键（事件被 PMIC 锁存）则把本次会话升级为交互唤醒。
-- 深睡唤醒源在启动时用 `esp_sleep_is_valid_wakeup_gpio()` 自检 GPIO25/4/28/23 并打印 `deep wake pins:` 日志。ESP32-C5 只有 LP 域 GPIO（0~6）能做深睡唤醒源；GPIO25 有效时用 `ESP_EXT1_WAKEUP_ALL_LOW` 单脚唤醒，无效时降级为纯定时器唤醒 + 锁存按键升级，`/api/power` 的 `deep_ok` 反映实际能力。GPIO4（IMU INT1）在中断寄存器表可用时额外用 `esp_deep_sleep_enable_gpio_wakeup()` arm 为高电平唤醒源；不可用或 arm 失败时只保留定时器/电源键，睡眠流程不受影响。
+- 深睡唤醒源在启动时用 `esp_sleep_is_valid_wakeup_gpio()` 自检 GPIO25/4/28/23 并打印 `deep wake pins:` 日志。ESP32-C5 只有 LP 域 GPIO（0~6）能做深睡唤醒源；GPIO25 有效时用 `ESP_EXT1_WAKEUP_ALL_LOW` 单脚唤醒，无效时降级为纯定时器唤醒 + 锁存按键升级，`/api/power` 的 `deep_ok` 反映实际能力。GPIO4（IMU INT1）在运动中断配置成功时额外用 `esp_deep_sleep_enable_gpio_wakeup()` arm 为高电平唤醒源，进深睡前由 `imu_app_prepare_wake()` 先配置中断（阈值、时长、三轴使能、INT1 映射、推挽高有效、锁存）再写 `RESET_INT = 1` 清锁存，唤醒后由 `imu_app_clear_wake()` 再清一次；配置读回不一致、清除失败或 arm 失败时只保留定时器/电源键，睡眠流程不受影响。GPIO25 仍不在 LP 域，深睡中的电源键靠 PMIC 锁存、到下一次唤醒才生效，而运动唤醒是即时唤醒路径。
 - 浅睡轮询使用 `esp_light_sleep_start()` + 定时唤醒；深睡则完全断电重启，靠 PCF8563 保时（开机 `pcf8563_restore_system_time()` 只向前调表，SNTP 成功后 `pcf8563_save_system_time()` 写回）。
 - 两种睡眠都在 `power_mgr` 持有 `screen_rotation` 锁、且 `web_server_screen_busy()` / `screen_rotation_busy()` 为假之后才进入，避免 SPI/Flash 任务与睡眠重叠。浅睡会冻结负责喂狗的空闲任务，因此进入低功耗前用 `esp_task_wdt_reconfigure()` 暂停任务看门狗，唤醒后按原配置恢复，避免长睡眠触发 TWDT。进入低功耗前（`enter_low_power()` 与 `power_mgr_deep_sleep()` 两条路径）都会调用 `tf_card_unmount()` 卸载 TF 卡并释放片选，避免 SD 卡与 SPI 上拉在睡眠中耗电；网页访问 TF 接口时 `tf_card_ensure_mounted()` 按需重新挂载。挂载、卸载都在 `board_spi_lock()` 保护下，且等 `web_server_screen_busy()` / `screen_rotation_busy()` 为假，不会与约 23 秒的整屏刷新重叠。
 - 画面底部的白底黑字小字（`AP 192.168.4.1` 或 `STA <ip>`）只在工作状态显示，由驱动在 SPI 发送前临时叠加，不会写入图片缓存；进入低功耗时先清掉小字，再绘制信息页，因此「有无 IP 小字」就是低功耗状态的直观指示。屏幕被电源键刷白（清屏）时保持白屏；信息页状态下再次按键会用 `screen_rotation_set_content_redraw()` 注册的回调恢复信息页，而不是图片。
@@ -170,7 +170,7 @@ idf.py -p COMx flash monitor
 | TF 卡 | `main/tf_card/` | 与屏幕共用 SPI2；以 FAT 文件系统按需挂载到 `/sdcard`，进入低功耗前卸载，不自动格式化卡；内容库目录 `/sdcard/eink`，维护日志 `/sdcard/log/power.csv` |
 | PMIC | `main/pmic/axp2101.c` | 初始化电源管理、读取电池/充电状态和电源键事件 |
 | RTC | `main/rtc/pcf8563.c` | 掉电保时；开机读取 RTC 灌入系统时钟（只向前调），SNTP 校时成功后写回；仅在 VL 置位或读数不合理时才用编译时间初始化 |
-| IMU | `main/imu/msa321.c`、`main/imu/imu_app.c` | `msa321.c` 以 ±4 g、125 Hz 配置并提供 any-motion 中断接口（寄存器表待手册核对）；`imu_app.c` 醒着时约 15 Hz 采样，识别翻面/双击换图，经 `/api/imu` 暴露状态，并向 `power_mgr` 提供深睡运动唤醒的 arm/clear |
+| IMU | `main/imu/msa321.c`、`main/imu/imu_app.c` | `msa321.c` 以 ±4 g、125 Hz 配置并提供 any-motion（active）中断接口：三轴使能、映射 INT1、推挽高有效、锁存，读回校验后由 `imu_app` arm 为深睡唤醒源，阈值/时长由 `MSA321_ACTIVE_TH` / `MSA321_ACTIVE_DUR` 宏给出；`imu_app.c` 醒着时约 15 Hz 采样，识别翻面/双击换图，经 `/api/imu` 暴露状态，并向 `power_mgr` 提供深睡运动唤醒的 arm/clear |
 
 SoftAP 默认启用 WPA2，`pmf_cfg.required = false` 以兼容旧手机；密码规则、修改方式与 BOOT 恢复流程见上文「网络身份与安全配置」。修改密码后 `wifi_mgr_apply_ap_config()` 让驱动立即用新配置重启热点，主任务收到 `web_server_set_net_changed_cb()` 的回调后强制重绘配网页（SSID / PASS）。OTA 空间与升级路线见 [docs/ota.md](docs/ota.md)。
 

@@ -56,6 +56,15 @@ bool imu_app_wake_supported(void)
 
 void imu_app_clear_wake(void)
 {
+    /* Snapshot the axis that started the event before RESET_INT drops it:
+     * false wakes from the desk can then be traced to a direction and the
+     * threshold tuned accordingly. Only the first boot call has data. */
+    uint8_t active = 0;
+    if (msa321_active_status(&active) == ESP_OK && (active & 0x07) != 0) {
+        const char *axis = (active & 0x04) ? "X" : (active & 0x02) ? "Y" : "Z";
+        ESP_LOGI(TAG, "last motion: %s %s (0x0B=0x%02X)", axis,
+                 (active & 0x08) ? "negative" : "positive", active);
+    }
     if (msa321_int_clear() == ESP_OK) {
         ESP_LOGI(TAG, "latched motion interrupt cleared");
     }
@@ -65,6 +74,15 @@ bool imu_app_prepare_wake(void)
 {
     if (!imu_app_wake_supported()) {
         return false;
+    }
+    /* board.c configures every shared IRQ input with an internal pull-up.
+     * INT1 is push-pull and active high here, so the pull-up only sinks about
+     * 70 uA while the sensor drives the line low all night, and it reads as
+     * "motion" if the sensor ever loses power. A pull-down is the correct
+     * bias for this signal. */
+    esp_err_t pull = gpio_set_pull_mode(imu_irq, GPIO_PULLDOWN_ONLY);
+    if (pull != ESP_OK) {
+        ESP_LOGW(TAG, "GPIO%d pull-down: %s", (int)imu_irq, esp_err_to_name(pull));
     }
     esp_err_t err = msa321_int_config_motion();
     if (err != ESP_OK) {

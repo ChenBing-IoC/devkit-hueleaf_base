@@ -9,6 +9,7 @@
 #include "driver/i2c_master.h"
 #include "esp_check.h"
 #include "esp_log.h"
+#include "esp_rom_sys.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -22,9 +23,27 @@ static const char *TAG = "imu";
 #define REG_SOFTRESET        0x00
 #define REG_PARTID           0x01
 #define REG_ACC_X_L          0x02
+#define REG_MOTION_INT       0x09   /* RO interrupt status */
+#define REG_TAP_ACTIVE_STATUS 0x0B  /* RO which axis started the event */
 #define REG_RANGE            0x0F
 #define REG_ODR              0x10
 #define REG_PWR              0x11
+#define REG_INT_SET_0        0x16   /* R/W per-interrupt enable */
+#define REG_INT_MAP_0        0x19   /* R/W route interrupts to INT1 */
+#define REG_INT_CONFIG       0x20   /* R/W INT1 output type and level */
+#define REG_INT_LATCH        0x21   /* R/W latch mode + RESET_INT */
+#define REG_ACTIVE_DUR       0x27   /* R/W ACTIVE_DUR[1:0] */
+#define REG_ACTIVE_TH        0x28   /* R/W ACTIVE_TH[7:0] */
+
+/* MSA321 register map, pages 20/23/24/25. */
+#define MOTION_INT_ACTIVE    0x04   /* 0x09 bit2 ACTIVE_INT, read only */
+#define INT_SET_ACTIVE_XYZ   0x07   /* 0x16 ACTIVE_INT_EN_Z/Y/X */
+#define INT_MAP_INT1_ACTIVE  0x04   /* 0x19 bit2 INT1_ACTIVE */
+/* 0x20 carries only INT1_OD (bit1, 0 = push-pull) and INT1_LVL (bit0,
+ * 0 = active low); the part has a single interrupt pin, no INT2 fields. */
+#define INT_CONFIG_ACTIVE_HIGH 0x01 /* 0x20 push-pull, active high */
+#define INT_LATCH_RESET_INT  0x80   /* 0x21 bit7, write 1 clears every latch */
+#define INT_LATCH_MODE       0x07   /* 0x21 LATCH_INT 0111 = latched */
 
 #define RANGE_4G             0x01
 #define ODR_125HZ            0x07
@@ -122,49 +141,116 @@ bool msa321_present(void)
     return s_inited && s_present;
 }
 
-/* The MSA311/MSA321 register manual is not part of this tree and this build
- * environment has no network access. The interrupt register addresses are
- * deliberately absent instead of guessed: a wrong address would program an
- * unrelated control register on real hardware.
- *
- * To enable motion wake, fill msa321_int_config_motion() and
- * msa321_int_clear() from the register manual (any-motion threshold and
- * duration, interrupt enable, INT1 mapping, push-pull / active high / latched
- * configuration, status clear) and set the switch below to 1. imu_app and the
- * power manager pick it up without further changes. */
-#ifndef MSA321_INT_REGS_VERIFIED
-#define MSA321_INT_REGS_VERIFIED 0
-#endif
-
 bool msa321_int_ready(void)
 {
-    return msa321_present() && MSA321_INT_REGS_VERIFIED;
+    return msa321_present();
+}
+
+esp_err_t msa321_active_status(uint8_t *raw)
+{
+    if (!msa321_present() || raw == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    return imu_read(REG_TAP_ACTIVE_STATUS, raw, 1);
+}
+
+/* Set bits in a register without touching the rest: 0x16 and 0x19 also carry
+ * the orientation and tap enables, which must survive a motion re-arm. */
+static esp_err_t imu_set_bits(uint8_t reg, uint8_t bits)
+{
+    uint8_t val = 0;
+    ESP_RETURN_ON_ERROR(imu_read(reg, &val, 1), TAG, "read 0x%02X", reg);
+    return imu_write_u8(reg, (uint8_t)(val | bits));
 }
 
 esp_err_t msa321_int_config_motion(void)
 {
+    uint8_t cfg = 0, latch = 0, set0 = 0, map0 = 0, th = 0, dur = 0;
+
     if (!msa321_present()) {
         return ESP_ERR_INVALID_STATE;
     }
-#if MSA321_INT_REGS_VERIFIED
-    /* Program any-motion threshold/duration, enable it, map it to INT1 and set
-     * push-pull, active high, latched. Return ESP_OK only after read-back. */
-    return ESP_ERR_NOT_SUPPORTED;
-#else
-    static bool warned;
-    if (!warned) {
-        warned = true;
-        ESP_LOGW(TAG, "motion interrupt unavailable: register table not verified");
+
+    /* Order matters only for 0x21: it is written last so the latch cannot hold
+     * an event that the threshold write itself created. */
+    ESP_RETURN_ON_ERROR(imu_write_u8(REG_INT_CONFIG, INT_CONFIG_ACTIVE_HIGH),
+                        TAG, "int config");
+    ESP_RETURN_ON_ERROR(imu_write_u8(REG_ACTIVE_TH, MSA321_ACTIVE_TH),
+                        TAG, "active th");
+    ESP_RETURN_ON_ERROR(imu_write_u8(REG_ACTIVE_DUR, MSA321_ACTIVE_DUR),
+                        TAG, "active dur");
+    ESP_RETURN_ON_ERROR(imu_set_bits(REG_INT_SET_0, INT_SET_ACTIVE_XYZ),
+                        TAG, "int set");
+    ESP_RETURN_ON_ERROR(imu_set_bits(REG_INT_MAP_0, INT_MAP_INT1_ACTIVE),
+                        TAG, "int map");
+    /* Latched so INT1 stays high for the whole sleep; RESET_INT stays 0. */
+    ESP_RETURN_ON_ERROR(imu_write_u8(REG_INT_LATCH, INT_LATCH_MODE),
+                        TAG, "int latch");
+
+    ESP_RETURN_ON_ERROR(imu_read(REG_INT_CONFIG, &cfg, 1), TAG, "rb cfg");
+    ESP_RETURN_ON_ERROR(imu_read(REG_INT_LATCH, &latch, 1), TAG, "rb latch");
+    ESP_RETURN_ON_ERROR(imu_read(REG_INT_SET_0, &set0, 1), TAG, "rb set");
+    ESP_RETURN_ON_ERROR(imu_read(REG_INT_MAP_0, &map0, 1), TAG, "rb map");
+    ESP_RETURN_ON_ERROR(imu_read(REG_ACTIVE_TH, &th, 1), TAG, "rb th");
+    ESP_RETURN_ON_ERROR(imu_read(REG_ACTIVE_DUR, &dur, 1), TAG, "rb dur");
+
+    ESP_LOGI(TAG, "int regs 0x20=%02X 0x21=%02X 0x16=%02X 0x19=%02X 0x28=%02X 0x27=%02X",
+             cfg, latch, set0, map0, th, dur);
+    /* Only the meaningful bits are compared: reserved bits may read back
+     * differently on a clone, but a dropped write must not arm the wake. */
+    if ((cfg & 0x03) != INT_CONFIG_ACTIVE_HIGH ||
+        (latch & 0x0F) != INT_LATCH_MODE ||
+        (set0 & INT_SET_ACTIVE_XYZ) != INT_SET_ACTIVE_XYZ ||
+        (map0 & INT_MAP_INT1_ACTIVE) != INT_MAP_INT1_ACTIVE ||
+        th != MSA321_ACTIVE_TH ||
+        dur != (uint8_t)(MSA321_ACTIVE_DUR & 0x03)) {
+        ESP_LOGE(TAG, "motion interrupt read-back mismatch");
+        return ESP_FAIL;
     }
-    return ESP_ERR_NOT_SUPPORTED;
-#endif
+
+    ESP_LOGI(TAG, "motion wake: %d mg over %d ms, INT1 latched high",
+             (int)(MSA321_ACTIVE_TH * 781 / 100), (int)(MSA321_ACTIVE_DUR + 1));
+    return ESP_OK;
 }
 
 esp_err_t msa321_int_clear(void)
 {
+    uint8_t status = 0;
+    uint8_t cfg = 0;
+    uint8_t latch = 0;
+
     if (!msa321_int_ready()) {
         return ESP_ERR_NOT_SUPPORTED;
     }
-    /* Read the interrupt status register until the any-motion bit clears. */
-    return ESP_ERR_NOT_SUPPORTED;
+
+    /* 0x21 = 0x87: RESET_INT (write 1 clears all latched interrupts) plus
+     * LATCH_INT 0111, so the configuration survives the clear and the next
+     * event latches again. Three retries 2 ms apart cover a sample landing
+     * between the write and the status read. */
+    for (int attempt = 0; attempt <= 3; attempt++) {
+        ESP_RETURN_ON_ERROR(imu_write_u8(REG_INT_LATCH,
+                                         (uint8_t)(INT_LATCH_RESET_INT | INT_LATCH_MODE)),
+                            TAG, "int reset");
+        /* The map documents RESET_INT as a level, not as self-clearing. Leaving
+         * it at 1 would hold every latch in reset and INT1 would never assert,
+         * so release it when the read-back shows it is still set. */
+        ESP_RETURN_ON_ERROR(imu_read(REG_INT_LATCH, &latch, 1), TAG, "rb latch");
+        if ((latch & INT_LATCH_RESET_INT) != 0) {
+            ESP_RETURN_ON_ERROR(imu_write_u8(REG_INT_LATCH,
+                                             (uint8_t)(latch & INT_LATCH_MODE)),
+                                TAG, "reset release");
+        }
+        ESP_RETURN_ON_ERROR(imu_read(REG_MOTION_INT, &status, 1), TAG, "status");
+        ESP_RETURN_ON_ERROR(imu_read(REG_INT_CONFIG, &cfg, 1), TAG, "cfg");
+        if ((status & MOTION_INT_ACTIVE) == 0) {
+            ESP_LOGI(TAG, "active interrupt cleared, 0x09=%02X 0x20=%02X", status, cfg);
+            return ESP_OK;
+        }
+        /* Real 2 ms: the 100 Hz tick would round pdMS_TO_TICKS(2) down to 0
+         * and the retry would race the status register. */
+        esp_rom_delay_us(2000);
+    }
+
+    ESP_LOGE(TAG, "active interrupt still latched: 0x09=%02X 0x20=%02X", status, cfg);
+    return ESP_FAIL;
 }
